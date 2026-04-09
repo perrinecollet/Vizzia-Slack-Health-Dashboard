@@ -317,7 +317,8 @@ export default function Dashboard() {
                 <div onClick={() => setExpandedPerson(expandedPerson === p.id ? null : p.id)} style={{ ...s.row, cursor: "pointer" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <span style={{ fontSize: 13, color: "#4b5563", fontWeight: 700, width: 22 }}>#{i + 1}</span>
-                    {p.avatar && <img src={p.avatar} style={{ width: 30, height: 30, borderRadius: "50%" }} />}
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    {p.avatar && <img src={p.avatar} alt="" style={{ width: 30, height: 30, borderRadius: "50%" }} />}
                     <div>
                       <div style={{ fontWeight: 600, fontSize: 13 }}>{p.name}</div>
                       {p.title && <div style={{ fontSize: 11, color: "#6b6b8a" }}>{p.title}</div>}
@@ -377,7 +378,7 @@ export default function Dashboard() {
             <>
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Notifier les channels non conformes</div>
-                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>{data.nonCompliant.length} channel(s) — owner tagué dans #help-slack. Pour notifier individuellement → onglet 📢 Channels.</div>
+                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>{data.nonCompliant.length} channel(s) — owner tagué dans #help-slack. Pour notifier individuellement : onglet 📢 Channels.</div>
                 <button onClick={() => sendNonCompliant()} style={s.btn("#dc2626")}>📩 Notifier tous ({data.nonCompliant.length})</button>
               </div>
               <div style={s.card}>
