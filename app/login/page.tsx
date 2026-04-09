@@ -29,7 +29,8 @@ function LoginForm() {
         disabled={loading}
         style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, width: "100%", padding: "12px", background: "#fff", border: "none", borderRadius: 9, fontSize: 14, fontWeight: 600, color: "#1a1a1a", cursor: "pointer" }}
       >
-        <img src="https://www.google.com/favicon.ico" width={18} height={18} alt="Google" />
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src="https://www.google.com/favicon.ico" width={18} height={18} alt="" />
         {loading ? "Connexion..." : "Se connecter avec Google"}
       </button>
     </div>
