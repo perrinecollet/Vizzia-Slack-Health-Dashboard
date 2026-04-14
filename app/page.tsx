@@ -18,10 +18,12 @@ const daysSince = (ts: string | null) =>
 
 const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 100) : 0);
 
-const TABS = ["kpi", "channels", "people", "actions", "log"] as const;
+const TABS = ["kpi", "channels", "actions", "log"] as const;
 const TAB_LABELS: Record<string, string> = {
-  kpi: "📊 KPIs", channels: "📢 Channels", people: "👥 People",
-  actions: "🚀 Actions", log: "📋 Journal",
+  kpi: "📊 KPIs",
+  channels: "📢 Channels",
+  actions: "🚀 Actions",
+  log: "📋 Journal",
 };
 
 export default function Dashboard() {
@@ -36,14 +38,12 @@ export default function Dashboard() {
   const [tab, setTab] = useState<string>("kpi");
   const [chanFilter, setChanFilter] = useState("all");
   const [chanSearch, setChanSearch] = useState("");
-  const [peopleSort, setPeopleSort] = useState("messages");
   const [expandedChan, setExpandedChan] = useState<string | null>(null);
-  const [expandedPerson, setExpandedPerson] = useState<string | null>(null);
 
   const addLog = (msg: string) =>
     setLog((l) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...l]);
 
-  // ── PHASE 1 : channels + membres (rapide) ──────────────────────────────────
+  // ── PHASE 1 : channels + membres (rapide) ─────────────────────────────────
   const loadPhase1 = useCallback(async () => {
     setLoading(true);
     setLoadMsg("Récupération des channels...");
@@ -94,23 +94,10 @@ export default function Dashboard() {
         tempDormant: [],
         helpChan,
         pubCount: channels.filter((c: any) => !c.is_private).length,
-        privCount: channels.filter((c: any) => c.is_private).length,
         withDesc: channels.filter((c: any) => c.purpose?.value).length,
         withTopic: channels.filter((c: any) => c.topic?.value).length,
         total: channels.length,
         statsLoaded: false,
-        peopleStats: members.slice(0, 80).map((m: any) => ({
-          id: m.id,
-          name: m.real_name || m.name,
-          avatar: m.profile?.image_48 || "",
-          title: m.profile?.title || "",
-          messages: 0,
-          threadRatio: 0,
-          pubRatio: 0,
-          reactionsGiven: 0,
-          reactionsReceived: 0,
-          mentions: 0,
-        })),
       });
       addLog(`✅ ${channels.length} channels, ${members.length} membres chargés`);
     } catch (e: any) {
@@ -120,37 +107,36 @@ export default function Dashboard() {
     setLoadMsg("");
   }, []);
 
-  // ── Chargement auto au démarrage (phase 1 uniquement) ─────────────────────
+  // ── Chargement auto au démarrage ──────────────────────────────────────────
   useEffect(() => { loadPhase1(); }, [loadPhase1]);
 
-  // ── PHASE 2 : stats 90j par channel (lent, manuel) ────────────────────────
+  // ── PHASE 2 : dernière activité par channel (sans filtre oldest) ──────────
   const loadPhase2 = useCallback(async () => {
     if (!data) return;
     setLoading(true);
-    addLog("🔄 Chargement stats 90j par channel...");
-    const oldest = String(Math.floor((Date.now() / 1000) - 90 * 86400));
+    addLog("🔄 Chargement dernière activité par channel...");
     const chanStats: Record<string, string | null> = {};
 
     for (let i = 0; i < data.channels.length; i++) {
       const ch = data.channels[i];
-      setLoadMsg(`Stats ${i + 1}/${data.channels.length}...`);
+      setLoadMsg(`Activité ${i + 1}/${data.channels.length}...`);
       try {
+        // Pas de filtre oldest → vrai dernier message quelle que soit sa date
         const r = await slackApi("conversations.history", {
           channel: ch.id,
           limit: 1,
-          oldest,
         });
         chanStats[ch.id] = r.messages?.[0]?.ts || null;
       } catch {
         chanStats[ch.id] = null;
       }
-      // Petit délai pour éviter le rate limit Slack
       await new Promise((res) => setTimeout(res, 80));
     }
 
     const updatedChannels = data.channels.map((ch: any) => ({
       ...ch,
       lastTs: chanStats[ch.id] ?? null,
+      // Dormant = dernier message il y a plus de 90j (ou aucun message)
       dormant: daysSince(chanStats[ch.id] ?? null) > 90,
     }));
 
@@ -165,40 +151,68 @@ export default function Dashboard() {
       ),
       statsLoaded: true,
     }));
-    addLog(`✅ Stats chargées pour ${data.channels.length} channels`);
+    addLog(`✅ Activité chargée pour ${data.channels.length} channels`);
     setLoading(false);
     setLoadMsg("");
   }, [data]);
 
-  // ── ACTIONS ADMIN ──────────────────────────────────────────────────────────
-  const sendNonCompliant = async (ch?: any) => {
+  // ── ACTIONS ADMIN ─────────────────────────────────────────────────────────
+
+  // Notifier un channel individuel (depuis l'onglet Channels)
+  const sendNonCompliantOne = async (ch: any) => {
     if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
-    const list = ch ? [ch] : data.nonCompliant;
-    for (const c of list) {
-      const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
-      const issues = c.issues
-        .map((i: string) =>
-          i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Description"
-        )
-        .join(", ");
-      await slackApi("chat.postMessage", {
-        channel: data.helpChan.id,
-        text: `📋 *Channel non conforme* : #${c.name}\n${owner} merci de corriger : ${issues}`,
-      });
-    }
-    addLog(`✅ ${list.length} notification(s) envoyée(s) sur #help-slack`);
+    const owner = ch.creator ? `<@${ch.creator}>` : "owner inconnu";
+    const issues = ch.issues
+      .map((i: string) =>
+        i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Description"
+      )
+      .join(", ");
+    await slackApi("chat.postMessage", {
+      channel: data.helpChan.id,
+      text: `📋 *Channel non conforme* : #${ch.name}\n${owner} merci de corriger : ${issues}`,
+    });
+    addLog(`✅ Notification envoyée pour #${ch.name}`);
   };
 
+  // Un seul message récap pour tous les non-conformes (depuis Actions)
+  const sendNonCompliantAll = async () => {
+    if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
+    if (data.nonCompliant.length === 0) { addLog("✅ Aucun channel non conforme"); return; }
+    const date = new Date().toLocaleDateString("fr-FR");
+    const lines = data.nonCompliant
+      .map((c: any) => {
+        const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
+        const issues = c.issues
+          .map((i: string) =>
+            i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Desc"
+          )
+          .join(", ");
+        return `• #${c.name} — ${owner} — ${issues}`;
+      })
+      .join("\n");
+    await slackApi("chat.postMessage", {
+      channel: data.helpChan.id,
+      text: `📋 *Channels non conformes — récap du ${date}*\n\n${lines}`,
+    });
+    addLog(`✅ Récap envoyé pour ${data.nonCompliant.length} channels non conformes`);
+  };
+
+  // Un seul message récap pour tous les dormants
   const alertDormant = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
-    for (const c of data.dormant) {
-      const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
-      await slackApi("chat.postMessage", {
-        channel: data.helpChan.id,
-        text: `💤 *Channel dormant* : #${c.name} (${daysSince(c.lastTs)}j)\n${owner} souhaitez-vous archiver ce channel ?`,
-      });
-    }
-    addLog(`✅ ${data.dormant.length} alerte(s) envoyée(s)`);
+    if (data.dormant.length === 0) { addLog("✅ Aucun channel dormant"); return; }
+    const date = new Date().toLocaleDateString("fr-FR");
+    const lines = data.dormant
+      .map((c: any) => {
+        const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
+        return `• #${c.name} — ${owner} — inactif depuis ${daysSince(c.lastTs)}j`;
+      })
+      .join("\n");
+    await slackApi("chat.postMessage", {
+      channel: data.helpChan.id,
+      text: `💤 *Channels dormants (+90j) — récap du ${date}*\n\n${lines}\n\nMerci de confirmer si ces channels peuvent être archivés.`,
+    });
+    addLog(`✅ Récap dormants envoyé pour ${data.dormant.length} channels`);
   };
 
   const archiveTemp = async () => {
@@ -208,10 +222,10 @@ export default function Dashboard() {
       if (r.ok) count++;
     }
     addLog(`✅ ${count} channel(s) temp- archivé(s)`);
-    loadPhase1(); // recharge les données de base après archivage
+    loadPhase1();
   };
 
-  // ── STYLES ─────────────────────────────────────────────────────────────────
+  // ── STYLES ────────────────────────────────────────────────────────────────
   const s = {
     wrap: { fontFamily: "Inter,sans-serif", background: "#0f0f1a", minHeight: "100vh", color: "#e2e2f0", padding: "20px" },
     card: { background: "#1a1a2e", borderRadius: 14, padding: "18px 20px", border: "1px solid #2d2d44", marginBottom: 14 },
@@ -220,9 +234,27 @@ export default function Dashboard() {
     tabBtn: (a: boolean) => ({ padding: "8px 16px", borderRadius: 8, border: "none", background: a ? "#4f46e5" : "transparent", color: a ? "#fff" : "#6b6b8a", fontWeight: 600, fontSize: 12, cursor: "pointer" } as React.CSSProperties),
     kpi: { background: "#1a1a2e", borderRadius: 12, padding: "14px", border: "1px solid #2d2d44", textAlign: "center" } as React.CSSProperties,
     input: { background: "#0f0f1a", border: "1px solid #2d2d44", borderRadius: 9, padding: "10px 14px", color: "#e2e2f0", fontSize: 13 } as React.CSSProperties,
-    select: { background: "#1a1a2e", border: "1px solid #2d2d44", borderRadius: 8, padding: "7px 12px", color: "#e2e2f0", fontSize: 12, cursor: "pointer" } as React.CSSProperties,
     row: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #2d2d44", gap: 8, flexWrap: "wrap" } as React.CSSProperties,
+    filterBtn: (active: boolean) => ({
+      padding: "6px 14px",
+      borderRadius: 20,
+      border: `1px solid ${active ? "#4f46e5" : "#2d2d44"}`,
+      background: active ? "#4f46e5" : "transparent",
+      color: active ? "#fff" : "#9ca3af",
+      fontWeight: active ? 600 : 400,
+      fontSize: 12,
+      cursor: "pointer",
+      whiteSpace: "nowrap",
+    } as React.CSSProperties),
   };
+
+  const FILTERS = [
+    { key: "all", label: "Tous" },
+    { key: "noncompliant", label: "⚠️ Non conformes" },
+    { key: "dormant", label: "💤 Dormants" },
+    { key: "temp", label: "🗑️ Temp-" },
+    { key: "public", label: "🌐 Publics" },
+  ];
 
   const filteredChannels = (data?.channels || [])
     .filter((c: any) => {
@@ -230,14 +262,9 @@ export default function Dashboard() {
       if (chanFilter === "dormant") return c.dormant;
       if (chanFilter === "temp") return c.name.startsWith("temp-");
       if (chanFilter === "public") return !c.is_private;
-      if (chanFilter === "private") return c.is_private;
       return true;
     })
     .filter((c: any) => c.name.includes(chanSearch.toLowerCase()));
-
-  const sortedPeople = [...(data?.peopleStats || [])].sort(
-    (a: any, b: any) => b[peopleSort] - a[peopleSort]
-  );
 
   return (
     <div style={s.wrap}>
@@ -255,19 +282,17 @@ export default function Dashboard() {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {/* Bouton phase 1 — toujours visible */}
           <button onClick={loadPhase1} disabled={loading} style={s.btn("#059669")}>
-            {loading && !data?.statsLoaded ? `⏳ ${loadMsg}` : "🔄 Actualiser"}
+            {loading && !data ? `⏳ ${loadMsg}` : "🔄 Actualiser"}
           </button>
-          {/* Bouton phase 2 — visible seulement quand phase 1 est faite */}
           {data && !data.statsLoaded && (
             <button onClick={loadPhase2} disabled={loading} style={s.btn("#2563eb")}>
-              {loading && data && !data.statsLoaded ? `⏳ ${loadMsg}` : "📊 Charger stats 90j"}
+              {loading && data && !data.statsLoaded ? `⏳ ${loadMsg}` : "📊 Charger activité"}
             </button>
           )}
           {data?.statsLoaded && (
             <button onClick={loadPhase2} disabled={loading} style={s.btn("#374151")}>
-              {loading ? `⏳ ${loadMsg}` : "↻ Mettre à jour stats"}
+              {loading ? `⏳ ${loadMsg}` : "↻ Mettre à jour activité"}
             </button>
           )}
           <button onClick={() => signOut({ callbackUrl: "/login" })} style={s.btn("#6b6b8a")}>
@@ -293,14 +318,14 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── BANDEAU STATS 90J NON CHARGÉES ── */}
+      {/* ── BANDEAU ACTIVITÉ NON CHARGÉE ── */}
       {data && !data.statsLoaded && tab !== "log" && (
         <div style={{ background: "#1e1b4b", border: "1px solid #3730a3", borderRadius: 10, padding: "10px 16px", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
           <span style={{ fontSize: 13, color: "#a5b4fc" }}>
-            ℹ️ Données de base chargées. Les stats d'activité (dormants, dernière activité) ne sont pas encore disponibles.
+            ℹ️ Channels et membres chargés. Cliquez sur "Charger activité" pour voir les dormants et la dernière activité par channel.
           </span>
           <button onClick={loadPhase2} disabled={loading} style={s.btn("#4f46e5")}>
-            {loading ? `⏳ ${loadMsg}` : "📊 Charger stats 90j"}
+            {loading ? `⏳ ${loadMsg}` : "📊 Charger activité"}
           </button>
         </div>
       )}
@@ -312,7 +337,6 @@ export default function Dashboard() {
             {[
               { label: "Total channels", val: data.total, icon: "📢", color: "#818cf8" },
               { label: "Publics", val: data.pubCount, icon: "🌐", color: "#34d399" },
-              { label: "Privés", val: data.privCount, icon: "🔒", color: "#f59e0b" },
               { label: "Non conformes", val: data.nonCompliant.length, icon: "⚠️", color: "#f87171" },
               { label: "Dormants +90j", val: data.statsLoaded ? data.dormant.length : "—", icon: "💤", color: "#6b6b8a" },
               { label: "Temp- à archiver", val: data.statsLoaded ? data.tempDormant.length : "—", icon: "🗑️", color: "#c084fc" },
@@ -326,16 +350,6 @@ export default function Dashboard() {
                 <div style={{ fontSize: 11, color: "#6b6b8a" }}>{k.label}</div>
               </div>
             ))}
-          </div>
-          <div style={s.card}>
-            <div style={{ fontWeight: 700, marginBottom: 10 }}>Ratio Public / Privé</div>
-            <div style={{ background: "#0f0f1a", borderRadius: 8, height: 12, overflow: "hidden", marginBottom: 6 }}>
-              <div style={{ width: `${pct(data.pubCount, data.total)}%`, background: "linear-gradient(90deg,#4f46e5,#818cf8)", height: "100%" }} />
-            </div>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#6b6b8a" }}>
-              <span>🌐 Public {pct(data.pubCount, data.total)}%</span>
-              <span>🔒 Privé {pct(data.privCount, data.total)}%</span>
-            </div>
           </div>
           <div style={s.card}>
             <div style={{ fontWeight: 700, marginBottom: 10 }}>Compliance channels</div>
@@ -361,23 +375,37 @@ export default function Dashboard() {
       {/* ── CHANNELS ── */}
       {tab === "channels" && data && (
         <div style={s.card}>
+          {/* Filtres en boutons pills visibles */}
           <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+            {FILTERS.map((f) => {
+              const count =
+                f.key === "all" ? data.total :
+                f.key === "noncompliant" ? data.nonCompliant.length :
+                f.key === "dormant" ? data.dormant.length :
+                f.key === "temp" ? data.channels.filter((c: any) => c.name.startsWith("temp-")).length :
+                data.pubCount;
+              return (
+                <button
+                  key={f.key}
+                  onClick={() => setChanFilter(f.key)}
+                  style={s.filterBtn(chanFilter === f.key)}
+                >
+                  {f.label} <span style={{ opacity: 0.7, marginLeft: 4 }}>{count}</span>
+                </button>
+              );
+            })}
+          </div>
+          {/* Barre de recherche */}
+          <div style={{ marginBottom: 12 }}>
             <input
               value={chanSearch}
               onChange={(e) => setChanSearch(e.target.value)}
-              placeholder="🔍 Rechercher..."
-              style={{ ...s.input, width: 180 }}
+              placeholder="🔍 Rechercher un channel..."
+              style={{ ...s.input, width: "100%", maxWidth: 300 }}
             />
-            <select value={chanFilter} onChange={(e) => setChanFilter(e.target.value)} style={s.select}>
-              <option value="all">Tous ({data.total})</option>
-              <option value="noncompliant">Non conformes ({data.nonCompliant.length})</option>
-              <option value="dormant">Dormants ({data.dormant.length})</option>
-              <option value="temp">Temp- ({data.channels.filter((c: any) => c.name.startsWith("temp-")).length})</option>
-              <option value="public">Publics ({data.pubCount})</option>
-              <option value="private">Privés ({data.privCount})</option>
-            </select>
-            <span style={{ fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} résultats</span>
+            <span style={{ marginLeft: 12, fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} résultats</span>
           </div>
+          {/* Liste */}
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {filteredChannels.map((c: any) => (
               <div key={c.id}>
@@ -417,93 +445,17 @@ export default function Dashboard() {
                     </div>
                     <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
                       ⏱️ Dernière activité : <span style={{ color: "#e2e2f0" }}>
-                        {!data.statsLoaded ? "Non chargée" : c.lastTs ? `il y a ${daysSince(c.lastTs)}j` : "Aucun message sur 90j"}
+                        {!data.statsLoaded ? "Non chargée" : c.lastTs ? `il y a ${daysSince(c.lastTs)}j` : "Aucun message"}
                       </span>
                     </div>
                     <div style={{ color: "#6b6b8a", marginBottom: 8 }}>
                       👤 Owner : <span style={{ color: "#818cf8" }}>{c.creator ? `<@${c.creator}>` : "Inconnu"}</span>
                     </div>
                     {isAdmin && c.issues.length > 0 && (
-                      <button onClick={() => sendNonCompliant(c)} style={s.btn("#dc2626")}>
+                      <button onClick={() => sendNonCompliantOne(c)} style={s.btn("#dc2626")}>
                         📩 Notifier owner
                       </button>
                     )}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ── PEOPLE ── */}
-      {tab === "people" && data && (
-        <div style={s.card}>
-          <div style={{ display: "flex", gap: 8, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
-            <span style={{ fontSize: 13, fontWeight: 600 }}>Trier par :</span>
-            <select value={peopleSort} onChange={(e) => setPeopleSort(e.target.value)} style={s.select}>
-              <option value="messages">Messages envoyés</option>
-              <option value="threadRatio">% en thread</option>
-              <option value="pubRatio">% publics</option>
-              <option value="reactionsGiven">Réactions envoyées</option>
-              <option value="reactionsReceived">Réactions reçues</option>
-              <option value="mentions">Mentions</option>
-            </select>
-            {!data.statsLoaded && (
-              <span style={{ fontSize: 11, color: "#f59e0b" }}>⚠️ Stats à charger pour voir l'activité</span>
-            )}
-          </div>
-          <div style={{ maxHeight: 520, overflowY: "auto" }}>
-            {sortedPeople.map((p: any, i: number) => (
-              <div key={p.id}>
-                <div
-                  onClick={() => setExpandedPerson(expandedPerson === p.id ? null : p.id)}
-                  style={{ ...s.row, cursor: "pointer" }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <span style={{ fontSize: 13, color: "#4b5563", fontWeight: 700, width: 22 }}>#{i + 1}</span>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    {p.avatar && <img src={p.avatar} alt="" style={{ width: 30, height: 30, borderRadius: "50%" }} />}
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: 13 }}>{p.name}</div>
-                      {p.title && <div style={{ fontSize: 11, color: "#6b6b8a" }}>{p.title}</div>}
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                    {[
-                      { label: "💬 Msgs", val: p.messages },
-                      { label: "🧵 Thread", val: `${p.threadRatio}%` },
-                      { label: "🌐 Public", val: `${p.pubRatio}%` },
-                      { label: "👍 Reçues", val: p.reactionsReceived },
-                      { label: "❤️ Données", val: p.reactionsGiven },
-                    ].map((k) => (
-                      <div key={k.label} style={{ textAlign: "center", minWidth: 52 }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: "#818cf8" }}>{k.val}</div>
-                        <div style={{ fontSize: 10, color: "#6b6b8a" }}>{k.label}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                {expandedPerson === p.id && (
-                  <div style={{ background: "#0f0f1a", borderRadius: 8, padding: "12px 14px", marginBottom: 8 }}>
-                    {[
-                      { label: "Messages envoyés", val: p.messages, max: 500, color: "#818cf8" },
-                      { label: "% en thread", val: p.threadRatio, max: 100, color: "#34d399", suffix: "%" },
-                      { label: "% publics", val: p.pubRatio, max: 100, color: "#60a5fa", suffix: "%" },
-                      { label: "Réactions reçues", val: p.reactionsReceived, max: 200, color: "#f472b6" },
-                      { label: "Réactions envoyées", val: p.reactionsGiven, max: 200, color: "#f59e0b" },
-                      { label: "Mentions", val: p.mentions, max: 50, color: "#c084fc" },
-                    ].map((k) => (
-                      <div key={k.label} style={{ marginBottom: 8 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
-                          <span style={{ color: "#6b6b8a" }}>{k.label}</span>
-                          <span style={{ fontWeight: 700, color: k.color }}>{k.val}{(k as any).suffix || ""}</span>
-                        </div>
-                        <div style={{ background: "#1a1a2e", borderRadius: 5, height: 6, overflow: "hidden" }}>
-                          <div style={{ width: `${Math.min(100, (k.val / k.max) * 100)}%`, background: k.color, height: "100%", borderRadius: 5 }} />
-                        </div>
-                      </div>
-                    ))}
                   </div>
                 )}
               </div>
@@ -524,25 +476,29 @@ export default function Dashboard() {
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Notifier les channels non conformes</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
-                  {data.nonCompliant.length} channel(s) — owner tagué dans #help-slack. Pour notifier individuellement : onglet 📢 Channels.
+                  Envoie un seul message récapitulatif dans #help-slack listant les {data.nonCompliant.length} channels non conformes avec leur owner et les points à corriger.
                 </div>
-                <button onClick={() => sendNonCompliant()} style={s.btn("#dc2626")}>
-                  📩 Notifier tous ({data.nonCompliant.length})
+                <button onClick={sendNonCompliantAll} style={s.btn("#dc2626")}>
+                  📩 Envoyer récap ({data.nonCompliant.length})
                 </button>
               </div>
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>💤 Alerter owners — channels dormants</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
-                  {data.statsLoaded ? `${data.dormant.length} channel(s) inactif(s) depuis +90j` : "⚠️ Chargez les stats 90j pour voir les dormants"}
+                  {data.statsLoaded
+                    ? `Envoie un récap dans #help-slack pour les ${data.dormant.length} channels inactifs depuis +90j.`
+                    : "⚠️ Chargez l'activité pour voir les dormants"}
                 </div>
                 <button onClick={alertDormant} disabled={!data.statsLoaded} style={s.btn("#d97706")}>
-                  ⚠️ Envoyer alertes ({data.statsLoaded ? data.dormant.length : "?"})
+                  ⚠️ Envoyer récap dormants ({data.statsLoaded ? data.dormant.length : "?"})
                 </button>
               </div>
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>🗑️ Archiver les channels temp- inactifs</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 8 }}>
-                  {data.statsLoaded ? `${data.tempDormant.length} channel(s) à archiver` : "⚠️ Chargez les stats 90j pour voir les temp- dormants"}
+                  {data.statsLoaded
+                    ? `${data.tempDormant.length} channel(s) temp- dormants à archiver`
+                    : "⚠️ Chargez l'activité pour voir les temp- dormants"}
                 </div>
                 <div style={{ maxHeight: 100, overflowY: "auto", marginBottom: 10 }}>
                   {data.statsLoaded && data.tempDormant.map((c: any) => (
