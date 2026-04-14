@@ -23,7 +23,7 @@ const TAB_LABELS: Record<string, string> = {
   kpi: "📊 KPIs",
   channels: "📢 Channels",
   actions: "🚀 Actions",
-  log: "📋 Journal",
+  log: "📋 Log",
 };
 
 export default function Dashboard() {
@@ -43,12 +43,13 @@ export default function Dashboard() {
   const addLog = (msg: string) =>
     setLog((l) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...l]);
 
-  // ── PHASE 1 : channels + membres (rapide) ─────────────────────────────────
-  const loadPhase1 = useCallback(async () => {
+  // ── LOAD ALL DATA (channels + members + activity) ─────────────────────────
+  const loadData = useCallback(async () => {
     setLoading(true);
-    setLoadMsg("Récupération des channels...");
-    addLog("🔄 Chargement channels + membres...");
+    setLoadMsg("Fetching channels...");
+    addLog("🔄 Loading channels & members...");
     try {
+      // 1. Channels
       let channels: any[] = [], cursor = "";
       do {
         const r = await slackApi("conversations.list", {
@@ -61,7 +62,8 @@ export default function Dashboard() {
         cursor = r.response_metadata?.next_cursor || "";
       } while (cursor);
 
-      setLoadMsg(`${channels.length} channels. Récupération des membres...`);
+      // 2. Members
+      setLoadMsg(`${channels.length} channels found. Fetching members...`);
       let members: any[] = [], mc = "";
       do {
         const r = await slackApi("users.list", {
@@ -77,91 +79,79 @@ export default function Dashboard() {
         mc = r.response_metadata?.next_cursor || "";
       } while (mc);
 
-      const helpChan = channels.find((c: any) => c.name === "help-slack");
+      // Build a member lookup map id → display name
+      const memberMap: Record<string, string> = {};
+      for (const m of members) {
+        memberMap[m.id] = m.real_name || m.profile?.display_name || m.name;
+      }
+
+      // 3. Compliance check (no API call needed)
       const withIssues = channels.map((ch: any) => {
         const issues: string[] = [];
         if (!NAMING_PREFIXES.some((p) => ch.name.startsWith(p))) issues.push("naming");
         if (!ch.topic?.value) issues.push("topic");
         if (!ch.purpose?.value) issues.push("description");
-        return { ...ch, issues, lastTs: null, dormant: false };
+        const ownerName = ch.creator ? (memberMap[ch.creator] || ch.creator) : "Unknown";
+        return { ...ch, issues, lastTs: null, dormant: false, ownerName };
       });
 
+      // 4. Activity — last message per channel (no oldest filter → real last message)
+      setLoadMsg(`Fetching activity for ${channels.length} channels...`);
+      addLog(`✅ ${channels.length} channels, ${members.length} members loaded. Fetching activity...`);
+      const chanStats: Record<string, string | null> = {};
+
+      for (let i = 0; i < withIssues.length; i++) {
+        const ch = withIssues[i];
+        setLoadMsg(`Activity ${i + 1}/${withIssues.length}...`);
+        try {
+          const r = await slackApi("conversations.history", {
+            channel: ch.id,
+            limit: 1,
+          });
+          chanStats[ch.id] = r.messages?.[0]?.ts || null;
+        } catch {
+          chanStats[ch.id] = null;
+        }
+        await new Promise((res) => setTimeout(res, 80));
+      }
+
+      // 5. Merge activity into channels
+      const finalChannels = withIssues.map((ch: any) => ({
+        ...ch,
+        lastTs: chanStats[ch.id] ?? null,
+        dormant: daysSince(chanStats[ch.id] ?? null) > 90,
+      }));
+
+      const helpChan = channels.find((c: any) => c.name === "help-slack");
+
       setData({
-        channels: withIssues,
+        channels: finalChannels,
         members,
-        nonCompliant: withIssues.filter((c: any) => c.issues.length > 0),
-        dormant: [],
-        tempDormant: [],
+        nonCompliant: finalChannels.filter((c: any) => c.issues.length > 0),
+        dormant: finalChannels.filter((c: any) => c.dormant && !c.name.startsWith("temp-")),
+        tempDormant: finalChannels.filter((c: any) => c.name.startsWith("temp-") && c.dormant),
         helpChan,
         pubCount: channels.filter((c: any) => !c.is_private).length,
         withDesc: channels.filter((c: any) => c.purpose?.value).length,
         withTopic: channels.filter((c: any) => c.topic?.value).length,
         total: channels.length,
-        statsLoaded: false,
       });
-      addLog(`✅ ${channels.length} channels, ${members.length} membres chargés`);
+      addLog(`✅ Activity loaded for ${channels.length} channels`);
     } catch (e: any) {
-      addLog(`❌ Erreur: ${e.message}`);
+      addLog(`❌ Error: ${e.message}`);
     }
     setLoading(false);
     setLoadMsg("");
   }, []);
 
-  // ── Chargement auto au démarrage ──────────────────────────────────────────
-  useEffect(() => { loadPhase1(); }, [loadPhase1]);
+  // ── Auto-load on mount ────────────────────────────────────────────────────
+  useEffect(() => { loadData(); }, [loadData]);
 
-  // ── PHASE 2 : dernière activité par channel (sans filtre oldest) ──────────
-  const loadPhase2 = useCallback(async () => {
-    if (!data) return;
-    setLoading(true);
-    addLog("🔄 Chargement dernière activité par channel...");
-    const chanStats: Record<string, string | null> = {};
+  // ── ADMIN ACTIONS ─────────────────────────────────────────────────────────
 
-    for (let i = 0; i < data.channels.length; i++) {
-      const ch = data.channels[i];
-      setLoadMsg(`Activité ${i + 1}/${data.channels.length}...`);
-      try {
-        // Pas de filtre oldest → vrai dernier message quelle que soit sa date
-        const r = await slackApi("conversations.history", {
-          channel: ch.id,
-          limit: 1,
-        });
-        chanStats[ch.id] = r.messages?.[0]?.ts || null;
-      } catch {
-        chanStats[ch.id] = null;
-      }
-      await new Promise((res) => setTimeout(res, 80));
-    }
-
-    const updatedChannels = data.channels.map((ch: any) => ({
-      ...ch,
-      lastTs: chanStats[ch.id] ?? null,
-      // Dormant = dernier message il y a plus de 90j (ou aucun message)
-      dormant: daysSince(chanStats[ch.id] ?? null) > 90,
-    }));
-
-    setData((prev: any) => ({
-      ...prev,
-      channels: updatedChannels,
-      dormant: updatedChannels.filter(
-        (c: any) => c.dormant && !c.name.startsWith("temp-")
-      ),
-      tempDormant: updatedChannels.filter(
-        (c: any) => c.name.startsWith("temp-") && c.dormant
-      ),
-      statsLoaded: true,
-    }));
-    addLog(`✅ Activité chargée pour ${data.channels.length} channels`);
-    setLoading(false);
-    setLoadMsg("");
-  }, [data]);
-
-  // ── ACTIONS ADMIN ─────────────────────────────────────────────────────────
-
-  // Notifier un channel individuel (depuis l'onglet Channels)
+  // Notify a single non-compliant channel (from Channels tab)
   const sendNonCompliantOne = async (ch: any) => {
-    if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
-    const owner = ch.creator ? `<@${ch.creator}>` : "owner inconnu";
+    if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     const issues = ch.issues
       .map((i: string) =>
         i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Description"
@@ -169,50 +159,46 @@ export default function Dashboard() {
       .join(", ");
     await slackApi("chat.postMessage", {
       channel: data.helpChan.id,
-      text: `📋 *Channel non conforme* : #${ch.name}\n${owner} merci de corriger : ${issues}`,
+      text: `📋 *Non-compliant channel*: #${ch.name}\n${ch.ownerName} please fix: ${issues}`,
     });
-    addLog(`✅ Notification envoyée pour #${ch.name}`);
+    addLog(`✅ Notification sent for #${ch.name}`);
   };
 
-  // Un seul message récap pour tous les non-conformes (depuis Actions)
+  // Send a single recap for all non-compliant channels (from Actions tab)
   const sendNonCompliantAll = async () => {
-    if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
-    if (data.nonCompliant.length === 0) { addLog("✅ Aucun channel non conforme"); return; }
-    const date = new Date().toLocaleDateString("fr-FR");
+    if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
+    if (data.nonCompliant.length === 0) { addLog("✅ No non-compliant channels"); return; }
+    const date = new Date().toLocaleDateString("en-GB");
     const lines = data.nonCompliant
       .map((c: any) => {
-        const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
         const issues = c.issues
           .map((i: string) =>
             i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Desc"
           )
           .join(", ");
-        return `• #${c.name} — ${owner} — ${issues}`;
+        return `• #${c.name} — ${c.ownerName} — ${issues}`;
       })
       .join("\n");
     await slackApi("chat.postMessage", {
       channel: data.helpChan.id,
-      text: `📋 *Channels non conformes — récap du ${date}*\n\n${lines}`,
+      text: `📋 *Non-compliant channels — ${date}*\n\n${lines}`,
     });
-    addLog(`✅ Récap envoyé pour ${data.nonCompliant.length} channels non conformes`);
+    addLog(`✅ Batch sent for ${data.nonCompliant.length} non-compliant channels`);
   };
 
-  // Un seul message récap pour tous les dormants
+  // Send a single recap for all inactive channels
   const alertDormant = async () => {
-    if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
-    if (data.dormant.length === 0) { addLog("✅ Aucun channel dormant"); return; }
-    const date = new Date().toLocaleDateString("fr-FR");
+    if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
+    if (data.dormant.length === 0) { addLog("✅ No inactive channels"); return; }
+    const date = new Date().toLocaleDateString("en-GB");
     const lines = data.dormant
-      .map((c: any) => {
-        const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
-        return `• #${c.name} — ${owner} — inactif depuis ${daysSince(c.lastTs)}j`;
-      })
+      .map((c: any) => `• #${c.name} — ${c.ownerName} — inactive for ${daysSince(c.lastTs)} days`)
       .join("\n");
     await slackApi("chat.postMessage", {
       channel: data.helpChan.id,
-      text: `💤 *Channels dormants (+90j) — récap du ${date}*\n\n${lines}\n\nMerci de confirmer si ces channels peuvent être archivés.`,
+      text: `💤 *Inactive channels (+90 days) — ${date}*\n\n${lines}\n\nPlease confirm if these channels can be archived.`,
     });
-    addLog(`✅ Récap dormants envoyé pour ${data.dormant.length} channels`);
+    addLog(`✅ Batch sent for ${data.dormant.length} inactive channels`);
   };
 
   const archiveTemp = async () => {
@@ -221,8 +207,8 @@ export default function Dashboard() {
       const r = await slackApi("conversations.archive", { channel: c.id });
       if (r.ok) count++;
     }
-    addLog(`✅ ${count} channel(s) temp- archivé(s)`);
-    loadPhase1();
+    addLog(`✅ ${count} temp- channel(s) archived`);
+    loadData();
   };
 
   // ── STYLES ────────────────────────────────────────────────────────────────
@@ -249,11 +235,10 @@ export default function Dashboard() {
   };
 
   const FILTERS = [
-    { key: "all", label: "Tous" },
-    { key: "noncompliant", label: "⚠️ Non conformes" },
-    { key: "dormant", label: "💤 Dormants" },
+    { key: "all", label: "All" },
+    { key: "noncompliant", label: "⚠️ Non-compliant" },
+    { key: "dormant", label: "💤 Inactive" },
     { key: "temp", label: "🗑️ Temp-" },
-    { key: "public", label: "🌐 Publics" },
   ];
 
   const filteredChannels = (data?.channels || [])
@@ -261,7 +246,6 @@ export default function Dashboard() {
       if (chanFilter === "noncompliant") return c.issues.length > 0;
       if (chanFilter === "dormant") return c.dormant;
       if (chanFilter === "temp") return c.name.startsWith("temp-");
-      if (chanFilter === "public") return !c.is_private;
       return true;
     })
     .filter((c: any) => c.name.includes(chanSearch.toLowerCase()));
@@ -282,21 +266,11 @@ export default function Dashboard() {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={loadPhase1} disabled={loading} style={s.btn("#059669")}>
-            {loading && !data ? `⏳ ${loadMsg}` : "🔄 Actualiser"}
+          <button onClick={loadData} disabled={loading} style={s.btn("#059669")}>
+            {loading ? `⏳ ${loadMsg}` : "🔄 Refresh"}
           </button>
-          {data && !data.statsLoaded && (
-            <button onClick={loadPhase2} disabled={loading} style={s.btn("#2563eb")}>
-              {loading && data && !data.statsLoaded ? `⏳ ${loadMsg}` : "📊 Charger activité"}
-            </button>
-          )}
-          {data?.statsLoaded && (
-            <button onClick={loadPhase2} disabled={loading} style={s.btn("#374151")}>
-              {loading ? `⏳ ${loadMsg}` : "↻ Mettre à jour activité"}
-            </button>
-          )}
           <button onClick={() => signOut({ callbackUrl: "/login" })} style={s.btn("#6b6b8a")}>
-            Déconnexion
+            Sign out
           </button>
         </div>
       </div>
@@ -310,23 +284,11 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {/* ── CHARGEMENT EN COURS ── */}
+      {/* ── LOADING ── */}
       {!data && loading && (
         <div style={{ ...s.card, textAlign: "center", color: "#6b6b8a" }}>
           <div style={{ fontSize: 24, marginBottom: 8 }}>⏳</div>
-          <div style={{ fontWeight: 600 }}>{loadMsg || "Chargement..."}</div>
-        </div>
-      )}
-
-      {/* ── BANDEAU ACTIVITÉ NON CHARGÉE ── */}
-      {data && !data.statsLoaded && tab !== "log" && (
-        <div style={{ background: "#1e1b4b", border: "1px solid #3730a3", borderRadius: 10, padding: "10px 16px", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-          <span style={{ fontSize: 13, color: "#a5b4fc" }}>
-            ℹ️ Channels et membres chargés. Cliquez sur "Charger activité" pour voir les dormants et la dernière activité par channel.
-          </span>
-          <button onClick={loadPhase2} disabled={loading} style={s.btn("#4f46e5")}>
-            {loading ? `⏳ ${loadMsg}` : "📊 Charger activité"}
-          </button>
+          <div style={{ fontWeight: 600 }}>{loadMsg || "Loading..."}</div>
         </div>
       )}
 
@@ -336,13 +298,13 @@ export default function Dashboard() {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(150px,1fr))", gap: 10, marginBottom: 14 }}>
             {[
               { label: "Total channels", val: data.total, icon: "📢", color: "#818cf8" },
-              { label: "Publics", val: data.pubCount, icon: "🌐", color: "#34d399" },
-              { label: "Non conformes", val: data.nonCompliant.length, icon: "⚠️", color: "#f87171" },
-              { label: "Dormants +90j", val: data.statsLoaded ? data.dormant.length : "—", icon: "💤", color: "#6b6b8a" },
-              { label: "Temp- à archiver", val: data.statsLoaded ? data.tempDormant.length : "—", icon: "🗑️", color: "#c084fc" },
-              { label: "Avec description", val: `${pct(data.withDesc, data.total)}%`, icon: "📝", color: "#34d399" },
-              { label: "Avec topic", val: `${pct(data.withTopic, data.total)}%`, icon: "🏷️", color: "#60a5fa" },
-              { label: "Membres", val: data.members.length, icon: "👥", color: "#f472b6" },
+              { label: "Public", val: data.pubCount, icon: "🌐", color: "#34d399" },
+              { label: "Non-compliant", val: data.nonCompliant.length, icon: "⚠️", color: "#f87171" },
+              { label: "Inactive +90d", val: data.dormant.length, icon: "💤", color: "#6b6b8a" },
+              { label: "Temp- to archive", val: data.tempDormant.length, icon: "🗑️", color: "#c084fc" },
+              { label: "With description", val: `${pct(data.withDesc, data.total)}%`, icon: "📝", color: "#34d399" },
+              { label: "With topic", val: `${pct(data.withTopic, data.total)}%`, icon: "🏷️", color: "#60a5fa" },
+              { label: "Members", val: data.members.length, icon: "👥", color: "#f472b6" },
             ].map((k) => (
               <div key={k.label} style={s.kpi}>
                 <div style={{ fontSize: 20 }}>{k.icon}</div>
@@ -352,11 +314,11 @@ export default function Dashboard() {
             ))}
           </div>
           <div style={s.card}>
-            <div style={{ fontWeight: 700, marginBottom: 10 }}>Compliance channels</div>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>Channel compliance</div>
             {[
-              { label: "Naming conforme", val: pct(data.total - data.nonCompliant.filter((c: any) => c.issues.includes("naming")).length, data.total), color: "#34d399" },
-              { label: "Description renseignée", val: pct(data.withDesc, data.total), color: "#60a5fa" },
-              { label: "Topic renseigné", val: pct(data.withTopic, data.total), color: "#f59e0b" },
+              { label: "Compliant naming", val: pct(data.total - data.nonCompliant.filter((c: any) => c.issues.includes("naming")).length, data.total), color: "#34d399" },
+              { label: "Description filled", val: pct(data.withDesc, data.total), color: "#60a5fa" },
+              { label: "Topic filled", val: pct(data.withTopic, data.total), color: "#f59e0b" },
             ].map((k) => (
               <div key={k.label} style={{ marginBottom: 10 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
@@ -375,15 +337,14 @@ export default function Dashboard() {
       {/* ── CHANNELS ── */}
       {tab === "channels" && data && (
         <div style={s.card}>
-          {/* Filtres en boutons pills visibles */}
+          {/* Filter pills */}
           <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
             {FILTERS.map((f) => {
               const count =
                 f.key === "all" ? data.total :
                 f.key === "noncompliant" ? data.nonCompliant.length :
                 f.key === "dormant" ? data.dormant.length :
-                f.key === "temp" ? data.channels.filter((c: any) => c.name.startsWith("temp-")).length :
-                data.pubCount;
+                data.channels.filter((c: any) => c.name.startsWith("temp-")).length;
               return (
                 <button
                   key={f.key}
@@ -395,17 +356,17 @@ export default function Dashboard() {
               );
             })}
           </div>
-          {/* Barre de recherche */}
+          {/* Search */}
           <div style={{ marginBottom: 12 }}>
             <input
               value={chanSearch}
               onChange={(e) => setChanSearch(e.target.value)}
-              placeholder="🔍 Rechercher un channel..."
+              placeholder="🔍 Search a channel..."
               style={{ ...s.input, width: "100%", maxWidth: 300 }}
             />
-            <span style={{ marginLeft: 12, fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} résultats</span>
+            <span style={{ marginLeft: 12, fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} results</span>
           </div>
-          {/* Liste */}
+          {/* List */}
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {filteredChannels.map((c: any) => (
               <div key={c.id}>
@@ -418,16 +379,13 @@ export default function Dashboard() {
                     <span style={{ marginLeft: 8, fontSize: 11, color: "#6b6b8a" }}>{c.is_private ? "🔒" : "🌐"}</span>
                     {c.dormant && (
                       <span style={{ marginLeft: 6, fontSize: 10, background: "#1c1917", color: "#78716c", borderRadius: 5, padding: "1px 6px" }}>
-                        💤 {daysSince(c.lastTs)}j
+                        💤 {daysSince(c.lastTs)}d
                       </span>
-                    )}
-                    {!data.statsLoaded && (
-                      <span style={{ marginLeft: 6, fontSize: 10, color: "#4b5563" }}>activité non chargée</span>
                     )}
                   </div>
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                     {c.issues.length === 0
-                      ? <span style={s.badge(true)}>✅ Conforme</span>
+                      ? <span style={s.badge(true)}>✅ Compliant</span>
                       : c.issues.map((i: string) => (
                           <span key={i} style={s.badge(false)}>
                             {i === "naming" ? "naming" : i === "topic" ? "topic" : "desc"}
@@ -438,22 +396,22 @@ export default function Dashboard() {
                 {expandedChan === c.id && (
                   <div style={{ background: "#0f0f1a", borderRadius: 8, padding: "12px 14px", marginBottom: 8, fontSize: 12 }}>
                     <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
-                      📝 Description : <span style={{ color: c.purpose?.value ? "#e2e2f0" : "#f87171" }}>{c.purpose?.value || "Non renseignée"}</span>
+                      📝 Description: <span style={{ color: c.purpose?.value ? "#e2e2f0" : "#f87171" }}>{c.purpose?.value || "Not set"}</span>
                     </div>
                     <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
-                      🏷️ Topic : <span style={{ color: c.topic?.value ? "#e2e2f0" : "#f87171" }}>{c.topic?.value || "Non renseigné"}</span>
+                      🏷️ Topic: <span style={{ color: c.topic?.value ? "#e2e2f0" : "#f87171" }}>{c.topic?.value || "Not set"}</span>
                     </div>
                     <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
-                      ⏱️ Dernière activité : <span style={{ color: "#e2e2f0" }}>
-                        {!data.statsLoaded ? "Non chargée" : c.lastTs ? `il y a ${daysSince(c.lastTs)}j` : "Aucun message"}
+                      ⏱️ Last activity: <span style={{ color: "#e2e2f0" }}>
+                        {c.lastTs ? `${daysSince(c.lastTs)} days ago` : "No messages"}
                       </span>
                     </div>
                     <div style={{ color: "#6b6b8a", marginBottom: 8 }}>
-                      👤 Owner : <span style={{ color: "#818cf8" }}>{c.creator ? `<@${c.creator}>` : "Inconnu"}</span>
+                      👤 Owner: <span style={{ color: "#818cf8" }}>{c.ownerName}</span>
                     </div>
                     {isAdmin && c.issues.length > 0 && (
                       <button onClick={() => sendNonCompliantOne(c)} style={s.btn("#dc2626")}>
-                        📩 Notifier owner
+                        📩 Notify owner
                       </button>
                     )}
                   </div>
@@ -469,57 +427,53 @@ export default function Dashboard() {
         <div>
           {!isAdmin ? (
             <div style={{ ...s.card, borderColor: "#dc2626", textAlign: "center", color: "#f87171" }}>
-              🔒 Accès réservé aux administrateurs
+              🔒 Admin access only
             </div>
           ) : data ? (
             <>
               <div style={s.card}>
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Notifier les channels non conformes</div>
+                <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Non-compliant channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
-                  Envoie un seul message récapitulatif dans #help-slack listant les {data.nonCompliant.length} channels non conformes avec leur owner et les points à corriger.
+                  Sends a single recap message to #help-slack listing all {data.nonCompliant.length} non-compliant channels with their owner and issues.
                 </div>
                 <button onClick={sendNonCompliantAll} style={s.btn("#dc2626")}>
-                  📩 Envoyer récap ({data.nonCompliant.length})
+                  📩 Send batch non-compliant channels ({data.nonCompliant.length})
                 </button>
               </div>
               <div style={s.card}>
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>💤 Alerter owners — channels dormants</div>
+                <div style={{ fontWeight: 700, marginBottom: 4 }}>💤 Inactive channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
-                  {data.statsLoaded
-                    ? `Envoie un récap dans #help-slack pour les ${data.dormant.length} channels inactifs depuis +90j.`
-                    : "⚠️ Chargez l'activité pour voir les dormants"}
+                  Sends a single recap to #help-slack for the {data.dormant.length} channels inactive for 90+ days.
                 </div>
-                <button onClick={alertDormant} disabled={!data.statsLoaded} style={s.btn("#d97706")}>
-                  ⚠️ Envoyer récap dormants ({data.statsLoaded ? data.dormant.length : "?"})
+                <button onClick={alertDormant} style={s.btn("#d97706")}>
+                  📩 Send batch inactive channels ({data.dormant.length})
                 </button>
               </div>
               <div style={s.card}>
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>🗑️ Archiver les channels temp- inactifs</div>
+                <div style={{ fontWeight: 700, marginBottom: 4 }}>🗑️ Archive inactive temp- channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 8 }}>
-                  {data.statsLoaded
-                    ? `${data.tempDormant.length} channel(s) temp- dormants à archiver`
-                    : "⚠️ Chargez l'activité pour voir les temp- dormants"}
+                  {data.tempDormant.length} temp- channel(s) inactive for 90+ days.
                 </div>
                 <div style={{ maxHeight: 100, overflowY: "auto", marginBottom: 10 }}>
-                  {data.statsLoaded && data.tempDormant.map((c: any) => (
+                  {data.tempDormant.map((c: any) => (
                     <div key={c.id} style={{ fontSize: 12, fontFamily: "monospace", padding: "2px 0", borderBottom: "1px solid #2d2d44" }}>
-                      #{c.name} <span style={{ color: "#6b6b8a" }}>({daysSince(c.lastTs)}j)</span>
+                      #{c.name} <span style={{ color: "#6b6b8a" }}>({daysSince(c.lastTs)}d)</span>
                     </div>
                   ))}
-                  {data.statsLoaded && data.tempDormant.length === 0 && (
-                    <div style={{ color: "#4ade80", fontSize: 12 }}>✅ Aucun channel temp- à archiver</div>
+                  {data.tempDormant.length === 0 && (
+                    <div style={{ color: "#4ade80", fontSize: 12 }}>✅ No temp- channels to archive</div>
                   )}
                 </div>
-                {data.statsLoaded && data.tempDormant.length > 0 && (
+                {data.tempDormant.length > 0 && (
                   <button onClick={archiveTemp} style={s.btn("#7c3aed")}>
-                    🗑️ Archiver ({data.tempDormant.length})
+                    🗑️ Archive ({data.tempDormant.length})
                   </button>
                 )}
               </div>
             </>
           ) : (
             <div style={{ ...s.card, textAlign: "center", color: "#6b6b8a" }}>
-              Chargez les données d'abord.
+              Loading data...
             </div>
           )}
         </div>
@@ -528,9 +482,9 @@ export default function Dashboard() {
       {/* ── LOG ── */}
       {tab === "log" && (
         <div style={s.card}>
-          <div style={{ fontWeight: 700, marginBottom: 10 }}>📋 Journal d'activité</div>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>📋 Activity log</div>
           {log.length === 0 ? (
-            <div style={{ color: "#6b6b8a", fontSize: 13 }}>Aucune action.</div>
+            <div style={{ color: "#6b6b8a", fontSize: 13 }}>No actions yet.</div>
           ) : (
             log.map((m, i) => (
               <div key={i} style={{ fontSize: 12, padding: "5px 0", borderBottom: "1px solid #2d2d44", fontFamily: "monospace", color: m.includes("❌") ? "#f87171" : m.includes("✅") ? "#4ade80" : "#a0a0bf" }}>
