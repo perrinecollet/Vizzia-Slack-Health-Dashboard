@@ -43,7 +43,7 @@ export default function Dashboard() {
   const addLog = (msg: string) =>
     setLog((l) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...l]);
 
-  // ── LOAD ALL DATA (channels + members + activity) ─────────────────────────
+  // ── LOAD ALL DATA ─────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
     setLoading(true);
     setLoadMsg("Fetching channels...");
@@ -79,13 +79,18 @@ export default function Dashboard() {
         mc = r.response_metadata?.next_cursor || "";
       } while (mc);
 
-      // Build a member lookup map id → display name
+      // Member lookup map + external detection
       const memberMap: Record<string, string> = {};
+      let externalCount = 0;
       for (const m of members) {
         memberMap[m.id] = m.real_name || m.profile?.display_name || m.name;
+        const memberEmail: string = m.profile?.email || "";
+        if (memberEmail && !memberEmail.endsWith("@vizzia.fr")) {
+          externalCount++;
+        }
       }
 
-      // 3. Compliance check (no API call needed)
+      // 3. Compliance check
       const withIssues = channels.map((ch: any) => {
         const issues: string[] = [];
         if (!NAMING_PREFIXES.some((p) => ch.name.startsWith(p))) issues.push("naming");
@@ -95,7 +100,7 @@ export default function Dashboard() {
         return { ...ch, issues, lastTs: null, dormant: false, ownerName };
       });
 
-      // 4. Activity — last message per channel (no oldest filter → real last message)
+      // 4. Activity via conversations.info → last_message_ts (no membership required)
       setLoadMsg(`Fetching activity for ${channels.length} channels...`);
       addLog(`✅ ${channels.length} channels, ${members.length} members loaded. Fetching activity...`);
       const chanStats: Record<string, string | null> = {};
@@ -104,18 +109,17 @@ export default function Dashboard() {
         const ch = withIssues[i];
         setLoadMsg(`Activity ${i + 1}/${withIssues.length}...`);
         try {
-          const r = await slackApi("conversations.history", {
+          const r = await slackApi("conversations.info", {
             channel: ch.id,
-            limit: 1,
           });
-          chanStats[ch.id] = r.messages?.[0]?.ts || null;
+          chanStats[ch.id] = r.channel?.last_message_ts || null;
         } catch {
           chanStats[ch.id] = null;
         }
         await new Promise((res) => setTimeout(res, 80));
       }
 
-      // 5. Merge activity into channels
+      // 5. Merge activity
       const finalChannels = withIssues.map((ch: any) => ({
         ...ch,
         lastTs: chanStats[ch.id] ?? null,
@@ -123,18 +127,24 @@ export default function Dashboard() {
       }));
 
       const helpChan = channels.find((c: any) => c.name === "help-slack");
+      const pubChannels = finalChannels.filter((c: any) => !c.is_private);
+      const nonCompliant = finalChannels.filter((c: any) => c.issues.length > 0);
+      const dormant = finalChannels.filter((c: any) => c.dormant && !c.name.startsWith("temp-"));
+      const tempDormant = finalChannels.filter((c: any) => c.name.startsWith("temp-") && c.dormant);
 
       setData({
         channels: finalChannels,
         members,
-        nonCompliant: finalChannels.filter((c: any) => c.issues.length > 0),
-        dormant: finalChannels.filter((c: any) => c.dormant && !c.name.startsWith("temp-")),
-        tempDormant: finalChannels.filter((c: any) => c.name.startsWith("temp-") && c.dormant),
+        nonCompliant,
+        dormant,
+        tempDormant,
         helpChan,
-        pubCount: channels.filter((c: any) => !c.is_private).length,
-        withDesc: channels.filter((c: any) => c.purpose?.value).length,
-        withTopic: channels.filter((c: any) => c.topic?.value).length,
-        total: channels.length,
+        pubCount: pubChannels.length,
+        externalCount,
+        withDesc: finalChannels.filter((c: any) => c.purpose?.value).length,
+        withTopic: finalChannels.filter((c: any) => c.topic?.value).length,
+        namingCompliant: finalChannels.filter((c: any) => !c.issues.includes("naming")).length,
+        total: finalChannels.length,
       });
       addLog(`✅ Activity loaded for ${channels.length} channels`);
     } catch (e: any) {
@@ -144,12 +154,9 @@ export default function Dashboard() {
     setLoadMsg("");
   }, []);
 
-  // ── Auto-load on mount ────────────────────────────────────────────────────
   useEffect(() => { loadData(); }, [loadData]);
 
   // ── ADMIN ACTIONS ─────────────────────────────────────────────────────────
-
-  // Notify a single non-compliant channel (from Channels tab)
   const sendNonCompliantOne = async (ch: any) => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     const issues = ch.issues
@@ -164,7 +171,6 @@ export default function Dashboard() {
     addLog(`✅ Notification sent for #${ch.name}`);
   };
 
-  // Send a single recap for all non-compliant channels (from Actions tab)
   const sendNonCompliantAll = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     if (data.nonCompliant.length === 0) { addLog("✅ No non-compliant channels"); return; }
@@ -186,7 +192,6 @@ export default function Dashboard() {
     addLog(`✅ Batch sent for ${data.nonCompliant.length} non-compliant channels`);
   };
 
-  // Send a single recap for all inactive channels
   const alertDormant = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     if (data.dormant.length === 0) { addLog("✅ No inactive channels"); return; }
@@ -218,7 +223,8 @@ export default function Dashboard() {
     btn: (col = "#4f46e5") => ({ background: `linear-gradient(135deg,${col},${col}bb)`, border: "none", borderRadius: 8, padding: "8px 14px", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer", marginRight: 6, marginBottom: 4 } as React.CSSProperties),
     badge: (ok: boolean) => ({ display: "inline-block", borderRadius: 5, padding: "2px 7px", fontSize: 10, fontWeight: 700, background: ok ? "#14532d" : "#450a0a", color: ok ? "#4ade80" : "#f87171" } as React.CSSProperties),
     tabBtn: (a: boolean) => ({ padding: "8px 16px", borderRadius: 8, border: "none", background: a ? "#4f46e5" : "transparent", color: a ? "#fff" : "#6b6b8a", fontWeight: 600, fontSize: 12, cursor: "pointer" } as React.CSSProperties),
-    kpi: { background: "#1a1a2e", borderRadius: 12, padding: "14px", border: "1px solid #2d2d44", textAlign: "center" } as React.CSSProperties,
+    kpiPrimary: { background: "#1a1a2e", borderRadius: 12, padding: "18px 14px", border: "1px solid #2d2d44", textAlign: "center" } as React.CSSProperties,
+    kpiSecondary: { background: "#13131f", borderRadius: 12, padding: "14px", border: "1px solid #2d2d44", textAlign: "center" } as React.CSSProperties,
     input: { background: "#0f0f1a", border: "1px solid #2d2d44", borderRadius: 9, padding: "10px 14px", color: "#e2e2f0", fontSize: 13 } as React.CSSProperties,
     row: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #2d2d44", gap: 8, flexWrap: "wrap" } as React.CSSProperties,
     filterBtn: (active: boolean) => ({
@@ -295,28 +301,50 @@ export default function Dashboard() {
       {/* ── KPIs ── */}
       {tab === "kpi" && data && (
         <>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(150px,1fr))", gap: 10, marginBottom: 14 }}>
+          {/* Row 1 — primary metrics */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 10 }}>
+            <div style={s.kpiPrimary}>
+              <div style={{ fontSize: 22 }}>📢</div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: "#818cf8", margin: "6px 0" }}>{data.pubCount}</div>
+              <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>Total channels</div>
+              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>public</div>
+            </div>
+            <div style={s.kpiPrimary}>
+              <div style={{ fontSize: 22 }}>👥</div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: "#f472b6", margin: "6px 0" }}>{data.members.length}</div>
+              <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>Members</div>
+              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>active, excl. bots</div>
+            </div>
+            <div style={s.kpiPrimary}>
+              <div style={{ fontSize: 22 }}>🌍</div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: "#f59e0b", margin: "6px 0" }}>{data.externalCount}</div>
+              <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>External members</div>
+              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>non @vizzia.fr</div>
+            </div>
+          </div>
+
+          {/* Row 2 — secondary metrics */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 14 }}>
             {[
-              { label: "Total channels", val: data.total, icon: "📢", color: "#818cf8" },
-              { label: "Public", val: data.pubCount, icon: "🌐", color: "#34d399" },
-              { label: "Non-compliant", val: data.nonCompliant.length, icon: "⚠️", color: "#f87171" },
               { label: "Inactive +90d", val: data.dormant.length, icon: "💤", color: "#6b6b8a" },
               { label: "Temp- to archive", val: data.tempDormant.length, icon: "🗑️", color: "#c084fc" },
               { label: "With description", val: `${pct(data.withDesc, data.total)}%`, icon: "📝", color: "#34d399" },
               { label: "With topic", val: `${pct(data.withTopic, data.total)}%`, icon: "🏷️", color: "#60a5fa" },
-              { label: "Members", val: data.members.length, icon: "👥", color: "#f472b6" },
+              { label: "Naming compliant", val: `${pct(data.namingCompliant, data.total)}%`, icon: "✅", color: "#4ade80" },
             ].map((k) => (
-              <div key={k.label} style={s.kpi}>
-                <div style={{ fontSize: 20 }}>{k.icon}</div>
+              <div key={k.label} style={s.kpiSecondary}>
+                <div style={{ fontSize: 18 }}>{k.icon}</div>
                 <div style={{ fontSize: 22, fontWeight: 800, color: k.color, margin: "4px 0" }}>{k.val}</div>
                 <div style={{ fontSize: 11, color: "#6b6b8a" }}>{k.label}</div>
               </div>
             ))}
           </div>
+
+          {/* Compliance bars */}
           <div style={s.card}>
             <div style={{ fontWeight: 700, marginBottom: 10 }}>Channel compliance</div>
             {[
-              { label: "Compliant naming", val: pct(data.total - data.nonCompliant.filter((c: any) => c.issues.includes("naming")).length, data.total), color: "#34d399" },
+              { label: "Naming compliant", val: pct(data.namingCompliant, data.total), color: "#34d399" },
               { label: "Description filled", val: pct(data.withDesc, data.total), color: "#60a5fa" },
               { label: "Topic filled", val: pct(data.withTopic, data.total), color: "#f59e0b" },
             ].map((k) => (
@@ -446,7 +474,7 @@ export default function Dashboard() {
                   Sends a single recap to #help-slack for the {data.dormant.length} channels inactive for 90+ days.
                 </div>
                 <button onClick={alertDormant} style={s.btn("#d97706")}>
-                  📩 Send batch inactive channels ({data.dormant.length})
+                  ⚠️ Send batch inactive channels ({data.dormant.length})
                 </button>
               </div>
               <div style={s.card}>
