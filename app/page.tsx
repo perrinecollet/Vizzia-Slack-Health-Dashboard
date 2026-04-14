@@ -43,14 +43,20 @@ export default function Dashboard() {
   const addLog = (msg: string) =>
     setLog((l) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...l]);
 
-  const loadData = useCallback(async () => {
+  // ── PHASE 1 : channels + membres (rapide) ──────────────────────────────────
+  const loadPhase1 = useCallback(async () => {
     setLoading(true);
     setLoadMsg("Récupération des channels...");
-    addLog("🔄 Chargement des données Slack...");
+    addLog("🔄 Chargement channels + membres...");
     try {
       let channels: any[] = [], cursor = "";
       do {
-        const r = await slackApi("conversations.list", { types: "public_channel,private_channel", limit: 200, exclude_archived: true, ...(cursor ? { cursor } : {}) });
+        const r = await slackApi("conversations.list", {
+          types: "public_channel,private_channel",
+          limit: 200,
+          exclude_archived: true,
+          ...(cursor ? { cursor } : {}),
+        });
         channels = [...channels, ...(r.channels || [])];
         cursor = r.response_metadata?.next_cursor || "";
       } while (cursor);
@@ -58,19 +64,18 @@ export default function Dashboard() {
       setLoadMsg(`${channels.length} channels. Récupération des membres...`);
       let members: any[] = [], mc = "";
       do {
-        const r = await slackApi("users.list", { limit: 200, ...(mc ? { cursor: mc } : {}) });
-        members = [...members, ...(r.members || []).filter((m: any) => !m.is_bot && !m.deleted && m.id !== "USLACKBOT")];
+        const r = await slackApi("users.list", {
+          limit: 200,
+          ...(mc ? { cursor: mc } : {}),
+        });
+        members = [
+          ...members,
+          ...(r.members || []).filter(
+            (m: any) => !m.is_bot && !m.deleted && m.id !== "USLACKBOT"
+          ),
+        ];
         mc = r.response_metadata?.next_cursor || "";
       } while (mc);
-
-      setLoadMsg("Analyse des channels...");
-      const chanStats: Record<string, any> = {};
-      for (const ch of channels.slice(0, 60)) {
-        try {
-          const r = await slackApi("conversations.history", { channel: ch.id, limit: 1 });
-          chanStats[ch.id] = r.messages?.[0]?.ts || null;
-        } catch { chanStats[ch.id] = null; }
-      }
 
       const helpChan = channels.find((c: any) => c.name === "help-slack");
       const withIssues = channels.map((ch: any) => {
@@ -78,32 +83,33 @@ export default function Dashboard() {
         if (!NAMING_PREFIXES.some((p) => ch.name.startsWith(p))) issues.push("naming");
         if (!ch.topic?.value) issues.push("topic");
         if (!ch.purpose?.value) issues.push("description");
-        const lastTs = chanStats[ch.id] || null;
-        return { ...ch, issues, lastTs, dormant: daysSince(lastTs) > 90 };
+        return { ...ch, issues, lastTs: null, dormant: false };
       });
 
       setData({
         channels: withIssues,
         members,
         nonCompliant: withIssues.filter((c: any) => c.issues.length > 0),
-        dormant: withIssues.filter((c: any) => c.dormant && !c.name.startsWith("temp-")),
-        tempDormant: withIssues.filter((c: any) => c.name.startsWith("temp-") && c.dormant),
+        dormant: [],
+        tempDormant: [],
         helpChan,
         pubCount: channels.filter((c: any) => !c.is_private).length,
         privCount: channels.filter((c: any) => c.is_private).length,
         withDesc: channels.filter((c: any) => c.purpose?.value).length,
         withTopic: channels.filter((c: any) => c.topic?.value).length,
         total: channels.length,
+        statsLoaded: false,
         peopleStats: members.slice(0, 80).map((m: any) => ({
-          id: m.id, name: m.real_name || m.name,
+          id: m.id,
+          name: m.real_name || m.name,
           avatar: m.profile?.image_48 || "",
           title: m.profile?.title || "",
-          messages: Math.floor(Math.random() * 500),
-          threadRatio: Math.floor(Math.random() * 80),
-          pubRatio: Math.floor(Math.random() * 100),
-          reactionsGiven: Math.floor(Math.random() * 200),
-          reactionsReceived: Math.floor(Math.random() * 200),
-          mentions: Math.floor(Math.random() * 50),
+          messages: 0,
+          threadRatio: 0,
+          pubRatio: 0,
+          reactionsGiven: 0,
+          reactionsReceived: 0,
+          mentions: 0,
         })),
       });
       addLog(`✅ ${channels.length} channels, ${members.length} membres chargés`);
@@ -114,15 +120,71 @@ export default function Dashboard() {
     setLoadMsg("");
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  // ── Chargement auto au démarrage (phase 1 uniquement) ─────────────────────
+  useEffect(() => { loadPhase1(); }, [loadPhase1]);
 
+  // ── PHASE 2 : stats 90j par channel (lent, manuel) ────────────────────────
+  const loadPhase2 = useCallback(async () => {
+    if (!data) return;
+    setLoading(true);
+    addLog("🔄 Chargement stats 90j par channel...");
+    const oldest = String(Math.floor((Date.now() / 1000) - 90 * 86400));
+    const chanStats: Record<string, string | null> = {};
+
+    for (let i = 0; i < data.channels.length; i++) {
+      const ch = data.channels[i];
+      setLoadMsg(`Stats ${i + 1}/${data.channels.length}...`);
+      try {
+        const r = await slackApi("conversations.history", {
+          channel: ch.id,
+          limit: 1,
+          oldest,
+        });
+        chanStats[ch.id] = r.messages?.[0]?.ts || null;
+      } catch {
+        chanStats[ch.id] = null;
+      }
+      // Petit délai pour éviter le rate limit Slack
+      await new Promise((res) => setTimeout(res, 80));
+    }
+
+    const updatedChannels = data.channels.map((ch: any) => ({
+      ...ch,
+      lastTs: chanStats[ch.id] ?? null,
+      dormant: daysSince(chanStats[ch.id] ?? null) > 90,
+    }));
+
+    setData((prev: any) => ({
+      ...prev,
+      channels: updatedChannels,
+      dormant: updatedChannels.filter(
+        (c: any) => c.dormant && !c.name.startsWith("temp-")
+      ),
+      tempDormant: updatedChannels.filter(
+        (c: any) => c.name.startsWith("temp-") && c.dormant
+      ),
+      statsLoaded: true,
+    }));
+    addLog(`✅ Stats chargées pour ${data.channels.length} channels`);
+    setLoading(false);
+    setLoadMsg("");
+  }, [data]);
+
+  // ── ACTIONS ADMIN ──────────────────────────────────────────────────────────
   const sendNonCompliant = async (ch?: any) => {
     if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
     const list = ch ? [ch] : data.nonCompliant;
     for (const c of list) {
       const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
-      const issues = c.issues.map((i: string) => i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Description").join(", ");
-      await slackApi("chat.postMessage", { channel: data.helpChan.id, text: `📋 *Channel non conforme* : #${c.name}\n${owner} merci de corriger : ${issues}` });
+      const issues = c.issues
+        .map((i: string) =>
+          i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Description"
+        )
+        .join(", ");
+      await slackApi("chat.postMessage", {
+        channel: data.helpChan.id,
+        text: `📋 *Channel non conforme* : #${c.name}\n${owner} merci de corriger : ${issues}`,
+      });
     }
     addLog(`✅ ${list.length} notification(s) envoyée(s) sur #help-slack`);
   };
@@ -131,7 +193,10 @@ export default function Dashboard() {
     if (!data?.helpChan) { addLog("❌ #help-slack introuvable"); return; }
     for (const c of data.dormant) {
       const owner = c.creator ? `<@${c.creator}>` : "owner inconnu";
-      await slackApi("chat.postMessage", { channel: data.helpChan.id, text: `💤 *Channel dormant* : #${c.name} (${daysSince(c.lastTs)}j)\n${owner} souhaitez-vous archiver ce channel ?` });
+      await slackApi("chat.postMessage", {
+        channel: data.helpChan.id,
+        text: `💤 *Channel dormant* : #${c.name} (${daysSince(c.lastTs)}j)\n${owner} souhaitez-vous archiver ce channel ?`,
+      });
     }
     addLog(`✅ ${data.dormant.length} alerte(s) envoyée(s)`);
   };
@@ -143,9 +208,10 @@ export default function Dashboard() {
       if (r.ok) count++;
     }
     addLog(`✅ ${count} channel(s) temp- archivé(s)`);
-    loadData();
+    loadPhase1(); // recharge les données de base après archivage
   };
 
+  // ── STYLES ─────────────────────────────────────────────────────────────────
   const s = {
     wrap: { fontFamily: "Inter,sans-serif", background: "#0f0f1a", minHeight: "100vh", color: "#e2e2f0", padding: "20px" },
     card: { background: "#1a1a2e", borderRadius: 14, padding: "18px 20px", border: "1px solid #2d2d44", marginBottom: 14 },
@@ -169,28 +235,57 @@ export default function Dashboard() {
     })
     .filter((c: any) => c.name.includes(chanSearch.toLowerCase()));
 
-  const sortedPeople = [...(data?.peopleStats || [])].sort((a: any, b: any) => b[peopleSort] - a[peopleSort]);
+  const sortedPeople = [...(data?.peopleStats || [])].sort(
+    (a: any, b: any) => b[peopleSort] - a[peopleSort]
+  );
 
   return (
     <div style={s.wrap}>
+      {/* ── HEADER ── */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
         <div>
           <div style={{ fontWeight: 800, fontSize: 20 }}>⚡ Vizzia Slack Health Dashboard</div>
           <div style={{ fontSize: 12, color: "#6b6b8a" }}>
             {email}
-            {isAdmin && <span style={{ marginLeft: 8, background: "#1e1b4b", color: "#818cf8", borderRadius: 6, padding: "2px 8px", fontSize: 11 }}>✦ Admin</span>}
+            {isAdmin && (
+              <span style={{ marginLeft: 8, background: "#1e1b4b", color: "#818cf8", borderRadius: 6, padding: "2px 8px", fontSize: 11 }}>
+                ✦ Admin
+              </span>
+            )}
           </div>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={loadData} disabled={loading} style={s.btn("#059669")}>{loading ? `⏳ ${loadMsg}` : "🔄 Rafraîchir"}</button>
-          <button onClick={() => signOut({ callbackUrl: "/login" })} style={s.btn("#6b6b8a")}>Déconnexion</button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {/* Bouton phase 1 — toujours visible */}
+          <button onClick={loadPhase1} disabled={loading} style={s.btn("#059669")}>
+            {loading && !data?.statsLoaded ? `⏳ ${loadMsg}` : "🔄 Actualiser"}
+          </button>
+          {/* Bouton phase 2 — visible seulement quand phase 1 est faite */}
+          {data && !data.statsLoaded && (
+            <button onClick={loadPhase2} disabled={loading} style={s.btn("#2563eb")}>
+              {loading && data && !data.statsLoaded ? `⏳ ${loadMsg}` : "📊 Charger stats 90j"}
+            </button>
+          )}
+          {data?.statsLoaded && (
+            <button onClick={loadPhase2} disabled={loading} style={s.btn("#374151")}>
+              {loading ? `⏳ ${loadMsg}` : "↻ Mettre à jour stats"}
+            </button>
+          )}
+          <button onClick={() => signOut({ callbackUrl: "/login" })} style={s.btn("#6b6b8a")}>
+            Déconnexion
+          </button>
         </div>
       </div>
 
+      {/* ── TABS ── */}
       <div style={{ display: "flex", gap: 4, marginBottom: 18, background: "#1a1a2e", borderRadius: 10, padding: 4, width: "fit-content", flexWrap: "wrap" }}>
-        {TABS.map((t) => <button key={t} onClick={() => setTab(t)} style={s.tabBtn(tab === t)}>{TAB_LABELS[t]}</button>)}
+        {TABS.map((t) => (
+          <button key={t} onClick={() => setTab(t)} style={s.tabBtn(tab === t)}>
+            {TAB_LABELS[t]}
+          </button>
+        ))}
       </div>
 
+      {/* ── CHARGEMENT EN COURS ── */}
       {!data && loading && (
         <div style={{ ...s.card, textAlign: "center", color: "#6b6b8a" }}>
           <div style={{ fontSize: 24, marginBottom: 8 }}>⏳</div>
@@ -198,7 +293,19 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* KPIs */}
+      {/* ── BANDEAU STATS 90J NON CHARGÉES ── */}
+      {data && !data.statsLoaded && tab !== "log" && (
+        <div style={{ background: "#1e1b4b", border: "1px solid #3730a3", borderRadius: 10, padding: "10px 16px", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+          <span style={{ fontSize: 13, color: "#a5b4fc" }}>
+            ℹ️ Données de base chargées. Les stats d'activité (dormants, dernière activité) ne sont pas encore disponibles.
+          </span>
+          <button onClick={loadPhase2} disabled={loading} style={s.btn("#4f46e5")}>
+            {loading ? `⏳ ${loadMsg}` : "📊 Charger stats 90j"}
+          </button>
+        </div>
+      )}
+
+      {/* ── KPIs ── */}
       {tab === "kpi" && data && (
         <>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(150px,1fr))", gap: 10, marginBottom: 14 }}>
@@ -207,8 +314,8 @@ export default function Dashboard() {
               { label: "Publics", val: data.pubCount, icon: "🌐", color: "#34d399" },
               { label: "Privés", val: data.privCount, icon: "🔒", color: "#f59e0b" },
               { label: "Non conformes", val: data.nonCompliant.length, icon: "⚠️", color: "#f87171" },
-              { label: "Dormants +90j", val: data.dormant.length, icon: "💤", color: "#6b6b8a" },
-              { label: "Temp- à archiver", val: data.tempDormant.length, icon: "🗑️", color: "#c084fc" },
+              { label: "Dormants +90j", val: data.statsLoaded ? data.dormant.length : "—", icon: "💤", color: "#6b6b8a" },
+              { label: "Temp- à archiver", val: data.statsLoaded ? data.tempDormant.length : "—", icon: "🗑️", color: "#c084fc" },
               { label: "Avec description", val: `${pct(data.withDesc, data.total)}%`, icon: "📝", color: "#34d399" },
               { label: "Avec topic", val: `${pct(data.withTopic, data.total)}%`, icon: "🏷️", color: "#60a5fa" },
               { label: "Membres", val: data.members.length, icon: "👥", color: "#f472b6" },
@@ -239,7 +346,8 @@ export default function Dashboard() {
             ].map((k) => (
               <div key={k.label} style={{ marginBottom: 10 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-                  <span>{k.label}</span><span style={{ color: k.color, fontWeight: 700 }}>{k.val}%</span>
+                  <span>{k.label}</span>
+                  <span style={{ color: k.color, fontWeight: 700 }}>{k.val}%</span>
                 </div>
                 <div style={{ background: "#0f0f1a", borderRadius: 6, height: 8, overflow: "hidden" }}>
                   <div style={{ width: `${k.val}%`, background: k.color, height: "100%", borderRadius: 6 }} />
@@ -250,11 +358,16 @@ export default function Dashboard() {
         </>
       )}
 
-      {/* Channels */}
+      {/* ── CHANNELS ── */}
       {tab === "channels" && data && (
         <div style={s.card}>
           <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
-            <input value={chanSearch} onChange={(e) => setChanSearch(e.target.value)} placeholder="🔍 Rechercher..." style={{ ...s.input, width: 180 }} />
+            <input
+              value={chanSearch}
+              onChange={(e) => setChanSearch(e.target.value)}
+              placeholder="🔍 Rechercher..."
+              style={{ ...s.input, width: 180 }}
+            />
             <select value={chanFilter} onChange={(e) => setChanFilter(e.target.value)} style={s.select}>
               <option value="all">Tous ({data.total})</option>
               <option value="noncompliant">Non conformes ({data.nonCompliant.length})</option>
@@ -268,25 +381,52 @@ export default function Dashboard() {
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {filteredChannels.map((c: any) => (
               <div key={c.id}>
-                <div onClick={() => setExpandedChan(expandedChan === c.id ? null : c.id)} style={{ ...s.row, cursor: "pointer" }}>
+                <div
+                  onClick={() => setExpandedChan(expandedChan === c.id ? null : c.id)}
+                  style={{ ...s.row, cursor: "pointer" }}
+                >
                   <div>
                     <span style={{ fontFamily: "monospace", fontSize: 13 }}>#{c.name}</span>
                     <span style={{ marginLeft: 8, fontSize: 11, color: "#6b6b8a" }}>{c.is_private ? "🔒" : "🌐"}</span>
-                    {c.dormant && <span style={{ marginLeft: 6, fontSize: 10, background: "#1c1917", color: "#78716c", borderRadius: 5, padding: "1px 6px" }}>💤 {daysSince(c.lastTs)}j</span>}
+                    {c.dormant && (
+                      <span style={{ marginLeft: 6, fontSize: 10, background: "#1c1917", color: "#78716c", borderRadius: 5, padding: "1px 6px" }}>
+                        💤 {daysSince(c.lastTs)}j
+                      </span>
+                    )}
+                    {!data.statsLoaded && (
+                      <span style={{ marginLeft: 6, fontSize: 10, color: "#4b5563" }}>activité non chargée</span>
+                    )}
                   </div>
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                     {c.issues.length === 0
                       ? <span style={s.badge(true)}>✅ Conforme</span>
-                      : c.issues.map((i: string) => <span key={i} style={s.badge(false)}>{i === "naming" ? "naming" : i === "topic" ? "topic" : "desc"}</span>)}
+                      : c.issues.map((i: string) => (
+                          <span key={i} style={s.badge(false)}>
+                            {i === "naming" ? "naming" : i === "topic" ? "topic" : "desc"}
+                          </span>
+                        ))}
                   </div>
                 </div>
                 {expandedChan === c.id && (
                   <div style={{ background: "#0f0f1a", borderRadius: 8, padding: "12px 14px", marginBottom: 8, fontSize: 12 }}>
-                    <div style={{ color: "#6b6b8a", marginBottom: 4 }}>📝 Description : <span style={{ color: c.purpose?.value ? "#e2e2f0" : "#f87171" }}>{c.purpose?.value || "Non renseignée"}</span></div>
-                    <div style={{ color: "#6b6b8a", marginBottom: 4 }}>🏷️ Topic : <span style={{ color: c.topic?.value ? "#e2e2f0" : "#f87171" }}>{c.topic?.value || "Non renseigné"}</span></div>
-                    <div style={{ color: "#6b6b8a", marginBottom: 8 }}>👤 Owner : <span style={{ color: "#818cf8" }}>{c.creator ? `<@${c.creator}>` : "Inconnu"}</span></div>
+                    <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
+                      📝 Description : <span style={{ color: c.purpose?.value ? "#e2e2f0" : "#f87171" }}>{c.purpose?.value || "Non renseignée"}</span>
+                    </div>
+                    <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
+                      🏷️ Topic : <span style={{ color: c.topic?.value ? "#e2e2f0" : "#f87171" }}>{c.topic?.value || "Non renseigné"}</span>
+                    </div>
+                    <div style={{ color: "#6b6b8a", marginBottom: 4 }}>
+                      ⏱️ Dernière activité : <span style={{ color: "#e2e2f0" }}>
+                        {!data.statsLoaded ? "Non chargée" : c.lastTs ? `il y a ${daysSince(c.lastTs)}j` : "Aucun message sur 90j"}
+                      </span>
+                    </div>
+                    <div style={{ color: "#6b6b8a", marginBottom: 8 }}>
+                      👤 Owner : <span style={{ color: "#818cf8" }}>{c.creator ? `<@${c.creator}>` : "Inconnu"}</span>
+                    </div>
                     {isAdmin && c.issues.length > 0 && (
-                      <button onClick={() => sendNonCompliant(c)} style={s.btn("#dc2626")}>📩 Notifier owner</button>
+                      <button onClick={() => sendNonCompliant(c)} style={s.btn("#dc2626")}>
+                        📩 Notifier owner
+                      </button>
                     )}
                   </div>
                 )}
@@ -296,7 +436,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* People */}
+      {/* ── PEOPLE ── */}
       {tab === "people" && data && (
         <div style={s.card}>
           <div style={{ display: "flex", gap: 8, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
@@ -309,12 +449,17 @@ export default function Dashboard() {
               <option value="reactionsReceived">Réactions reçues</option>
               <option value="mentions">Mentions</option>
             </select>
-            <span style={{ fontSize: 11, color: "#f59e0b" }}>⚠️ Données 90j glissants</span>
+            {!data.statsLoaded && (
+              <span style={{ fontSize: 11, color: "#f59e0b" }}>⚠️ Stats à charger pour voir l'activité</span>
+            )}
           </div>
           <div style={{ maxHeight: 520, overflowY: "auto" }}>
             {sortedPeople.map((p: any, i: number) => (
               <div key={p.id}>
-                <div onClick={() => setExpandedPerson(expandedPerson === p.id ? null : p.id)} style={{ ...s.row, cursor: "pointer" }}>
+                <div
+                  onClick={() => setExpandedPerson(expandedPerson === p.id ? null : p.id)}
+                  style={{ ...s.row, cursor: "pointer" }}
+                >
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <span style={{ fontSize: 13, color: "#4b5563", fontWeight: 700, width: 22 }}>#{i + 1}</span>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -355,7 +500,7 @@ export default function Dashboard() {
                           <span style={{ fontWeight: 700, color: k.color }}>{k.val}{(k as any).suffix || ""}</span>
                         </div>
                         <div style={{ background: "#1a1a2e", borderRadius: 5, height: 6, overflow: "hidden" }}>
-                          <div style={{ width: `${Math.min(100, k.val / k.max * 100)}%`, background: k.color, height: "100%", borderRadius: 5 }} />
+                          <div style={{ width: `${Math.min(100, (k.val / k.max) * 100)}%`, background: k.color, height: "100%", borderRadius: 5 }} />
                         </div>
                       </div>
                     ))}
@@ -367,52 +512,76 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Actions */}
+      {/* ── ACTIONS ── */}
       {tab === "actions" && (
         <div>
           {!isAdmin ? (
             <div style={{ ...s.card, borderColor: "#dc2626", textAlign: "center", color: "#f87171" }}>
               🔒 Accès réservé aux administrateurs
             </div>
-          ) : data && (
+          ) : data ? (
             <>
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Notifier les channels non conformes</div>
-                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>{data.nonCompliant.length} channel(s) — owner tagué dans #help-slack. Pour notifier individuellement : onglet 📢 Channels.</div>
-                <button onClick={() => sendNonCompliant()} style={s.btn("#dc2626")}>📩 Notifier tous ({data.nonCompliant.length})</button>
+                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
+                  {data.nonCompliant.length} channel(s) — owner tagué dans #help-slack. Pour notifier individuellement : onglet 📢 Channels.
+                </div>
+                <button onClick={() => sendNonCompliant()} style={s.btn("#dc2626")}>
+                  📩 Notifier tous ({data.nonCompliant.length})
+                </button>
               </div>
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>💤 Alerter owners — channels dormants</div>
-                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>{data.dormant.length} channel(s) inactif(s) depuis +90j</div>
-                <button onClick={alertDormant} style={s.btn("#d97706")}>⚠️ Envoyer alertes ({data.dormant.length})</button>
+                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
+                  {data.statsLoaded ? `${data.dormant.length} channel(s) inactif(s) depuis +90j` : "⚠️ Chargez les stats 90j pour voir les dormants"}
+                </div>
+                <button onClick={alertDormant} disabled={!data.statsLoaded} style={s.btn("#d97706")}>
+                  ⚠️ Envoyer alertes ({data.statsLoaded ? data.dormant.length : "?"})
+                </button>
               </div>
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>🗑️ Archiver les channels temp- inactifs</div>
-                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 8 }}>{data.tempDormant.length} channel(s) à archiver</div>
+                <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 8 }}>
+                  {data.statsLoaded ? `${data.tempDormant.length} channel(s) à archiver` : "⚠️ Chargez les stats 90j pour voir les temp- dormants"}
+                </div>
                 <div style={{ maxHeight: 100, overflowY: "auto", marginBottom: 10 }}>
-                  {data.tempDormant.map((c: any) => (
+                  {data.statsLoaded && data.tempDormant.map((c: any) => (
                     <div key={c.id} style={{ fontSize: 12, fontFamily: "monospace", padding: "2px 0", borderBottom: "1px solid #2d2d44" }}>
                       #{c.name} <span style={{ color: "#6b6b8a" }}>({daysSince(c.lastTs)}j)</span>
                     </div>
                   ))}
-                  {data.tempDormant.length === 0 && <div style={{ color: "#4ade80", fontSize: 12 }}>✅ Aucun channel temp- à archiver</div>}
+                  {data.statsLoaded && data.tempDormant.length === 0 && (
+                    <div style={{ color: "#4ade80", fontSize: 12 }}>✅ Aucun channel temp- à archiver</div>
+                  )}
                 </div>
-                {data.tempDormant.length > 0 && <button onClick={archiveTemp} style={s.btn("#7c3aed")}>🗑️ Archiver ({data.tempDormant.length})</button>}
+                {data.statsLoaded && data.tempDormant.length > 0 && (
+                  <button onClick={archiveTemp} style={s.btn("#7c3aed")}>
+                    🗑️ Archiver ({data.tempDormant.length})
+                  </button>
+                )}
               </div>
             </>
+          ) : (
+            <div style={{ ...s.card, textAlign: "center", color: "#6b6b8a" }}>
+              Chargez les données d'abord.
+            </div>
           )}
         </div>
       )}
 
-      {/* Log */}
+      {/* ── LOG ── */}
       {tab === "log" && (
         <div style={s.card}>
           <div style={{ fontWeight: 700, marginBottom: 10 }}>📋 Journal d'activité</div>
-          {log.length === 0
-            ? <div style={{ color: "#6b6b8a", fontSize: 13 }}>Aucune action.</div>
-            : log.map((m, i) => (
-              <div key={i} style={{ fontSize: 12, padding: "5px 0", borderBottom: "1px solid #2d2d44", fontFamily: "monospace", color: m.includes("❌") ? "#f87171" : m.includes("✅") ? "#4ade80" : "#a0a0bf" }}>{m}</div>
-            ))}
+          {log.length === 0 ? (
+            <div style={{ color: "#6b6b8a", fontSize: 13 }}>Aucune action.</div>
+          ) : (
+            log.map((m, i) => (
+              <div key={i} style={{ fontSize: 12, padding: "5px 0", borderBottom: "1px solid #2d2d44", fontFamily: "monospace", color: m.includes("❌") ? "#f87171" : m.includes("✅") ? "#4ade80" : "#a0a0bf" }}>
+                {m}
+              </div>
+            ))
+          )}
         </div>
       )}
     </div>
