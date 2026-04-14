@@ -38,6 +38,7 @@ export default function Dashboard() {
   const [tab, setTab] = useState<string>("kpi");
   const [chanFilter, setChanFilter] = useState("all");
   const [chanSearch, setChanSearch] = useState("");
+  const [ownerFilter, setOwnerFilter] = useState("all");
   const [expandedChan, setExpandedChan] = useState<string | null>(null);
 
   const addLog = (msg: string) =>
@@ -79,7 +80,7 @@ export default function Dashboard() {
         mc = r.response_metadata?.next_cursor || "";
       } while (mc);
 
-      // Member lookup map + external detection
+      // Member lookup + external detection
       const memberMap: Record<string, string> = {};
       let externalCount = 0;
       for (const m of members) {
@@ -90,17 +91,17 @@ export default function Dashboard() {
         }
       }
 
-      // 3. Compliance check
+      // 3. Compliance check (no API call)
       const withIssues = channels.map((ch: any) => {
         const issues: string[] = [];
         if (!NAMING_PREFIXES.some((p) => ch.name.startsWith(p))) issues.push("naming");
         if (!ch.topic?.value) issues.push("topic");
         if (!ch.purpose?.value) issues.push("description");
         const ownerName = ch.creator ? (memberMap[ch.creator] || ch.creator) : "Unknown";
-        return { ...ch, issues, lastTs: null, dormant: false, ownerName };
+        return { ...ch, issues, ownerName, lastTs: null, dormant: false };
       });
 
-      // 4. Activity via conversations.info → last_message_ts (no membership required)
+      // 4. Activity — conversations.history limit:1 without oldest filter
       setLoadMsg(`Fetching activity for ${channels.length} channels...`);
       addLog(`✅ ${channels.length} channels, ${members.length} members loaded. Fetching activity...`);
       const chanStats: Record<string, string | null> = {};
@@ -109,10 +110,11 @@ export default function Dashboard() {
         const ch = withIssues[i];
         setLoadMsg(`Activity ${i + 1}/${withIssues.length}...`);
         try {
-          const r = await slackApi("conversations.info", {
+          const r = await slackApi("conversations.history", {
             channel: ch.id,
+            limit: 1,
           });
-          chanStats[ch.id] = r.channel?.last_message_ts || null;
+          chanStats[ch.id] = r.messages?.[0]?.ts || null;
         } catch {
           chanStats[ch.id] = null;
         }
@@ -127,7 +129,8 @@ export default function Dashboard() {
       }));
 
       const helpChan = channels.find((c: any) => c.name === "help-slack");
-      const pubChannels = finalChannels.filter((c: any) => !c.is_private);
+      const pubCount = finalChannels.filter((c: any) => !c.is_private).length;
+      const privCount = finalChannels.filter((c: any) => c.is_private).length;
       const nonCompliant = finalChannels.filter((c: any) => c.issues.length > 0);
       const dormant = finalChannels.filter((c: any) => c.dormant && !c.name.startsWith("temp-"));
       const tempDormant = finalChannels.filter((c: any) => c.name.startsWith("temp-") && c.dormant);
@@ -139,7 +142,8 @@ export default function Dashboard() {
         dormant,
         tempDormant,
         helpChan,
-        pubCount: pubChannels.length,
+        pubCount,
+        privCount,
         externalCount,
         withDesc: finalChannels.filter((c: any) => c.purpose?.value).length,
         withTopic: finalChannels.filter((c: any) => c.topic?.value).length,
@@ -223,9 +227,8 @@ export default function Dashboard() {
     btn: (col = "#4f46e5") => ({ background: `linear-gradient(135deg,${col},${col}bb)`, border: "none", borderRadius: 8, padding: "8px 14px", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer", marginRight: 6, marginBottom: 4 } as React.CSSProperties),
     badge: (ok: boolean) => ({ display: "inline-block", borderRadius: 5, padding: "2px 7px", fontSize: 10, fontWeight: 700, background: ok ? "#14532d" : "#450a0a", color: ok ? "#4ade80" : "#f87171" } as React.CSSProperties),
     tabBtn: (a: boolean) => ({ padding: "8px 16px", borderRadius: 8, border: "none", background: a ? "#4f46e5" : "transparent", color: a ? "#fff" : "#6b6b8a", fontWeight: 600, fontSize: 12, cursor: "pointer" } as React.CSSProperties),
-    kpiPrimary: { background: "#1a1a2e", borderRadius: 12, padding: "18px 14px", border: "1px solid #2d2d44", textAlign: "center" } as React.CSSProperties,
-    kpiSecondary: { background: "#13131f", borderRadius: 12, padding: "14px", border: "1px solid #2d2d44", textAlign: "center" } as React.CSSProperties,
     input: { background: "#0f0f1a", border: "1px solid #2d2d44", borderRadius: 9, padding: "10px 14px", color: "#e2e2f0", fontSize: 13 } as React.CSSProperties,
+    select: { background: "#1a1a2e", border: "1px solid #2d2d44", borderRadius: 8, padding: "7px 12px", color: "#e2e2f0", fontSize: 12, cursor: "pointer" } as React.CSSProperties,
     row: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #2d2d44", gap: 8, flexWrap: "wrap" } as React.CSSProperties,
     filterBtn: (active: boolean) => ({
       padding: "6px 14px",
@@ -247,6 +250,13 @@ export default function Dashboard() {
     { key: "temp", label: "🗑️ Temp-" },
   ];
 
+  // Sorted unique owner list for dropdown
+  const ownerList: string[] = data
+    ? Array.from(new Set(data.channels.map((c: any) => c.ownerName as string)))
+        .filter((o) => o && o !== "Unknown")
+        .sort((a, b) => (a as string).localeCompare(b as string)) as string[]
+    : [];
+
   const filteredChannels = (data?.channels || [])
     .filter((c: any) => {
       if (chanFilter === "noncompliant") return c.issues.length > 0;
@@ -254,7 +264,30 @@ export default function Dashboard() {
       if (chanFilter === "temp") return c.name.startsWith("temp-");
       return true;
     })
+    .filter((c: any) => ownerFilter === "all" || c.ownerName === ownerFilter)
     .filter((c: any) => c.name.includes(chanSearch.toLowerCase()));
+
+  // KPI grid styles — both rows same maxWidth, same column count (5)
+  const kpiGrid = {
+    display: "grid" as const,
+    gridTemplateColumns: "repeat(5, 1fr)",
+    gap: 10,
+    marginBottom: 10,
+  };
+  const kpiPrimary = {
+    background: "#1a1a2e",
+    borderRadius: 12,
+    padding: "18px 14px",
+    border: "1px solid #2d2d44",
+    textAlign: "center" as const,
+  };
+  const kpiSecondary = {
+    background: "#13131f",
+    borderRadius: 12,
+    padding: "14px",
+    border: "1px solid #2d2d44",
+    textAlign: "center" as const,
+  };
 
   return (
     <div style={s.wrap}>
@@ -301,30 +334,42 @@ export default function Dashboard() {
       {/* ── KPIs ── */}
       {tab === "kpi" && data && (
         <>
-          {/* Row 1 — primary metrics */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 10 }}>
-            <div style={s.kpiPrimary}>
-              <div style={{ fontSize: 22 }}>📢</div>
-              <div style={{ fontSize: 26, fontWeight: 800, color: "#818cf8", margin: "6px 0" }}>{data.pubCount}</div>
+          {/* Row 1 — 5 primary KPIs */}
+          <div style={kpiGrid}>
+            <div style={kpiPrimary}>
+              <div style={{ fontSize: 20 }}>📢</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: "#818cf8", margin: "6px 0" }}>{data.total}</div>
               <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>Total channels</div>
-              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>public</div>
+              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>all types</div>
             </div>
-            <div style={s.kpiPrimary}>
-              <div style={{ fontSize: 22 }}>👥</div>
-              <div style={{ fontSize: 26, fontWeight: 800, color: "#f472b6", margin: "6px 0" }}>{data.members.length}</div>
+            <div style={kpiPrimary}>
+              <div style={{ fontSize: 20 }}>🌐</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: "#34d399", margin: "6px 0" }}>{pct(data.pubCount, data.total)}%</div>
+              <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>Public channels</div>
+              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>{data.pubCount} channels</div>
+            </div>
+            <div style={kpiPrimary}>
+              <div style={{ fontSize: 20 }}>🔒</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: "#f59e0b", margin: "6px 0" }}>{pct(data.privCount, data.total)}%</div>
+              <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>Private channels</div>
+              <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>{data.privCount} channels</div>
+            </div>
+            <div style={kpiPrimary}>
+              <div style={{ fontSize: 20 }}>👥</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: "#f472b6", margin: "6px 0" }}>{data.members.length}</div>
               <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>Members</div>
               <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>active, excl. bots</div>
             </div>
-            <div style={s.kpiPrimary}>
-              <div style={{ fontSize: 22 }}>🌍</div>
-              <div style={{ fontSize: 26, fontWeight: 800, color: "#f59e0b", margin: "6px 0" }}>{data.externalCount}</div>
+            <div style={kpiPrimary}>
+              <div style={{ fontSize: 20 }}>🌍</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: "#f87171", margin: "6px 0" }}>{data.externalCount}</div>
               <div style={{ fontSize: 12, color: "#e2e2f0", fontWeight: 600 }}>External members</div>
               <div style={{ fontSize: 11, color: "#6b6b8a", marginTop: 2 }}>non @vizzia.fr</div>
             </div>
           </div>
 
-          {/* Row 2 — secondary metrics */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 14 }}>
+          {/* Row 2 — 5 secondary KPIs */}
+          <div style={{ ...kpiGrid, marginBottom: 14 }}>
             {[
               { label: "Inactive +90d", val: data.dormant.length, icon: "💤", color: "#6b6b8a" },
               { label: "Temp- to archive", val: data.tempDormant.length, icon: "🗑️", color: "#c084fc" },
@@ -332,9 +377,9 @@ export default function Dashboard() {
               { label: "With topic", val: `${pct(data.withTopic, data.total)}%`, icon: "🏷️", color: "#60a5fa" },
               { label: "Naming compliant", val: `${pct(data.namingCompliant, data.total)}%`, icon: "✅", color: "#4ade80" },
             ].map((k) => (
-              <div key={k.label} style={s.kpiSecondary}>
+              <div key={k.label} style={kpiSecondary}>
                 <div style={{ fontSize: 18 }}>{k.icon}</div>
-                <div style={{ fontSize: 22, fontWeight: 800, color: k.color, margin: "4px 0" }}>{k.val}</div>
+                <div style={{ fontSize: 20, fontWeight: 800, color: k.color, margin: "4px 0" }}>{k.val}</div>
                 <div style={{ fontSize: 11, color: "#6b6b8a" }}>{k.label}</div>
               </div>
             ))}
@@ -366,7 +411,7 @@ export default function Dashboard() {
       {tab === "channels" && data && (
         <div style={s.card}>
           {/* Filter pills */}
-          <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
             {FILTERS.map((f) => {
               const count =
                 f.key === "all" ? data.total :
@@ -384,16 +429,28 @@ export default function Dashboard() {
               );
             })}
           </div>
-          {/* Search */}
-          <div style={{ marginBottom: 12 }}>
+
+          {/* Search + Owner filter */}
+          <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
             <input
               value={chanSearch}
               onChange={(e) => setChanSearch(e.target.value)}
               placeholder="🔍 Search a channel..."
-              style={{ ...s.input, width: "100%", maxWidth: 300 }}
+              style={{ ...s.input, width: 220, padding: "7px 12px" }}
             />
-            <span style={{ marginLeft: 12, fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} results</span>
+            <select
+              value={ownerFilter}
+              onChange={(e) => setOwnerFilter(e.target.value)}
+              style={s.select}
+            >
+              <option value="all">All owners</option>
+              {ownerList.map((o) => (
+                <option key={o} value={o}>{o}</option>
+              ))}
+            </select>
+            <span style={{ fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} results</span>
           </div>
+
           {/* List */}
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {filteredChannels.map((c: any) => (
@@ -402,11 +459,15 @@ export default function Dashboard() {
                   onClick={() => setExpandedChan(expandedChan === c.id ? null : c.id)}
                   style={{ ...s.row, cursor: "pointer" }}
                 >
-                  <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span style={{ fontFamily: "monospace", fontSize: 13 }}>#{c.name}</span>
-                    <span style={{ marginLeft: 8, fontSize: 11, color: "#6b6b8a" }}>{c.is_private ? "🔒" : "🌐"}</span>
+                    <span style={{ fontSize: 11, color: "#6b6b8a" }}>{c.is_private ? "🔒" : "🌐"}</span>
+                    {/* Owner always visible */}
+                    <span style={{ fontSize: 11, color: "#818cf8", background: "#1e1b4b", borderRadius: 5, padding: "1px 7px" }}>
+                      👤 {c.ownerName}
+                    </span>
                     {c.dormant && (
-                      <span style={{ marginLeft: 6, fontSize: 10, background: "#1c1917", color: "#78716c", borderRadius: 5, padding: "1px 6px" }}>
+                      <span style={{ fontSize: 10, background: "#1c1917", color: "#78716c", borderRadius: 5, padding: "1px 6px" }}>
                         💤 {daysSince(c.lastTs)}d
                       </span>
                     )}
