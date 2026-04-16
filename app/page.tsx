@@ -59,9 +59,16 @@ export default function Dashboard() {
   const [ownerFilter, setOwnerFilter] = useState("all");
   const [expandedChan, setExpandedChan] = useState<string | null>(null);
   const [alertOwner, setAlertOwner] = useState("all");
+  // Button feedback state: key = button id, value = "sent" | null
+  const [sentFeedback, setSentFeedback] = useState<Record<string, boolean>>({});
 
   const addLog = (msg: string) =>
     setLog((l) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...l]);
+
+  const showFeedback = (key: string) => {
+    setSentFeedback((prev) => ({ ...prev, [key]: true }));
+    setTimeout(() => setSentFeedback((prev) => ({ ...prev, [key]: false })), 3000);
+  };
 
   // ── LOAD ALL DATA ─────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
@@ -122,6 +129,7 @@ export default function Dashboard() {
         const ownerDeactivated = ch.creator
           ? (members.find((m: any) => m.id === ch.creator)?.deleted ?? false)
           : false;
+        // Keep creator ID for Slack tagging
         return { ...ch, issues, ownerName, ownerDeactivated, lastTs: null, dormant: false };
       });
 
@@ -134,18 +142,13 @@ export default function Dashboard() {
         withIssues,
         async (ch) => {
           try {
-            const r = await slackApi("conversations.history", {
-              channel: ch.id,
-              limit: 1,
-            });
+            const r = await slackApi("conversations.history", { channel: ch.id, limit: 1 });
             chanStats[ch.id] = r.messages?.[0]?.ts || null;
           } catch {
             chanStats[ch.id] = null;
           }
           completed++;
-          if (completed % 20 === 0) {
-            setLoadMsg(`Activity ${completed}/${channels.length}...`);
-          }
+          if (completed % 20 === 0) setLoadMsg(`Activity ${completed}/${channels.length}...`);
         },
         10,
         500
@@ -192,6 +195,7 @@ export default function Dashboard() {
   useEffect(() => { loadData(); }, [loadData]);
 
   // ── ADMIN ACTIONS ─────────────────────────────────────────────────────────
+
   const sendNonCompliantOne = async (ch: any) => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     const issues = ch.issues
@@ -199,59 +203,66 @@ export default function Dashboard() {
         i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Description"
       )
       .join(", ");
+    const tag = ch.creator ? `<@${ch.creator}>` : ch.ownerName;
     const r = await slackApi("chat.postMessage", {
       channel: data.helpChan.id,
-      text: `📋 *Non-compliant channel*: #${ch.name}\n${ch.ownerName} please fix: ${issues}`,
+      text: `📋 *Non-compliant channel*: #${ch.name}\n${tag} please fix: ${issues}`,
     });
-    if (r.ok) addLog(`✅ Notification sent for #${ch.name}`);
+    if (r.ok) { addLog(`✅ Notification sent for #${ch.name}`); showFeedback(`one-${ch.id}`); }
     else addLog(`❌ Failed for #${ch.name}: ${r.error}`);
   };
 
+  // Batch non-compliant — grouped by owner, one line per channel
   const sendNonCompliantAll = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     if (data.nonCompliant.length === 0) { addLog("✅ No non-compliant channels"); return; }
     const date = new Date().toLocaleDateString("en-GB");
-    const lines = data.nonCompliant
-      .map((c: any) => {
-        const issues = c.issues
-          .map((i: string) =>
-            i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Desc"
-          )
-          .join(", ");
-        return `• #${c.name} — ${c.ownerName} — ${issues}`;
+
+    // Group by creator ID
+    const byOwner: Record<string, any[]> = {};
+    for (const c of data.nonCompliant) {
+      const key = c.creator || c.ownerName;
+      if (!byOwner[key]) byOwner[key] = [];
+      byOwner[key].push(c);
+    }
+
+    const lines = Object.entries(byOwner)
+      .map(([creatorId, chans]) => {
+        const tag = creatorId.startsWith("U") ? `<@${creatorId}>` : creatorId;
+        const chanLines = (chans as any[])
+          .map((c: any) => {
+            const issues = c.issues
+              .map((i: string) =>
+                i === "naming" ? "❌ Naming" : i === "topic" ? "❌ Topic" : "❌ Desc"
+              )
+              .join(", ");
+            return `    • #${c.name} — ${issues}`;
+          })
+          .join("\n");
+        return `${tag}\n${chanLines}`;
       })
-      .join("\n");
+      .join("\n\n");
+
     const r = await slackApi("chat.postMessage", {
       channel: data.helpChan.id,
       text: `📋 *Non-compliant channels — ${date}*\n\n${lines}`,
     });
-    if (r.ok) addLog(`✅ Batch sent for ${data.nonCompliant.length} non-compliant channels`);
+    if (r.ok) { addLog(`✅ Batch sent for ${data.nonCompliant.length} non-compliant channels`); showFeedback("batch-noncompliant"); }
     else addLog(`❌ Send failed: ${r.error}`);
   };
 
-  const alertDormant = async () => {
-    if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
-    if (data.dormant.length === 0) { addLog("✅ No inactive channels"); return; }
-    const date = new Date().toLocaleDateString("en-GB");
-    const lines = data.dormant
-      .map((c: any) => `• #${c.name} — ${c.ownerName} — inactive for ${daysSince(c.lastTs)} days`)
-      .join("\n");
-    const r = await slackApi("chat.postMessage", {
-      channel: data.helpChan.id,
-      text: `💤 *Inactive channels (+90 days) — ${date}*\n\n${lines}\n\nPlease confirm if these channels can be archived.`,
-    });
-    if (r.ok) addLog(`✅ Batch sent for ${data.dormant.length} inactive channels`);
-    else addLog(`❌ Send failed: ${r.error}`);
-  };
-
-  // Send non-compliant alert for a specific owner
+  // Alert by specific owner — grouped, one line per channel
   const sendAlertForOwner = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     if (alertOwner === "all") { addLog("❌ Please select a specific owner"); return; }
     const ownerChannels = data.nonCompliant.filter((c: any) => c.ownerName === alertOwner);
     if (ownerChannels.length === 0) { addLog(`✅ No non-compliant channels for ${alertOwner}`); return; }
+
     const date = new Date().toLocaleDateString("en-GB");
-    const lines = ownerChannels
+    const creatorId = ownerChannels[0]?.creator;
+    const tag = creatorId?.startsWith("U") ? `<@${creatorId}>` : alertOwner;
+
+    const chanLines = ownerChannels
       .map((c: any) => {
         const issues = c.issues
           .map((i: string) =>
@@ -261,11 +272,43 @@ export default function Dashboard() {
         return `• #${c.name} — ${issues}`;
       })
       .join("\n");
+
     const r = await slackApi("chat.postMessage", {
       channel: data.helpChan.id,
-      text: `📋 *Non-compliant channels for ${alertOwner} — ${date}*\n\n${lines}\n\nHi ${alertOwner}, please update these channels to meet Vizzia's naming standards.`,
+      text: `Non-compliant channels for ${tag} — ${date}\n\n${chanLines}\n\nPlease update these channels to meet Vizzia's naming standards.`,
     });
-    if (r.ok) addLog(`✅ Alert sent for ${alertOwner} (${ownerChannels.length} channels)`);
+    if (r.ok) { addLog(`✅ Alert sent for ${alertOwner} (${ownerChannels.length} channels)`); showFeedback("alert-owner"); }
+    else addLog(`❌ Send failed: ${r.error}`);
+  };
+
+  const alertDormant = async () => {
+    if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
+    if (data.dormant.length === 0) { addLog("✅ No inactive channels"); return; }
+    const date = new Date().toLocaleDateString("en-GB");
+
+    // Group by owner
+    const byOwner: Record<string, any[]> = {};
+    for (const c of data.dormant) {
+      const key = c.creator || c.ownerName;
+      if (!byOwner[key]) byOwner[key] = [];
+      byOwner[key].push(c);
+    }
+
+    const lines = Object.entries(byOwner)
+      .map(([creatorId, chans]) => {
+        const tag = creatorId.startsWith("U") ? `<@${creatorId}>` : creatorId;
+        const chanLines = (chans as any[])
+          .map((c: any) => `    • #${c.name} — inactive for ${daysSince(c.lastTs)} days`)
+          .join("\n");
+        return `${tag}\n${chanLines}`;
+      })
+      .join("\n\n");
+
+    const r = await slackApi("chat.postMessage", {
+      channel: data.helpChan.id,
+      text: `💤 *Inactive channels (+90 days) — ${date}*\n\n${lines}\n\nPlease confirm if these channels can be archived.`,
+    });
+    if (r.ok) { addLog(`✅ Batch sent for ${data.dormant.length} inactive channels`); showFeedback("batch-dormant"); }
     else addLog(`❌ Send failed: ${r.error}`);
   };
 
@@ -276,6 +319,7 @@ export default function Dashboard() {
       if (r.ok) count++;
     }
     addLog(`✅ ${count} temp- channel(s) archived`);
+    showFeedback("archive-temp");
     loadData();
   };
 
@@ -283,7 +327,12 @@ export default function Dashboard() {
   const s = {
     wrap: { fontFamily: "Inter,sans-serif", background: "#0f0f1a", minHeight: "100vh", color: "#e2e2f0", padding: "20px" },
     card: { background: "#1a1a2e", borderRadius: 14, padding: "18px 20px", border: "1px solid #2d2d44", marginBottom: 14 },
-    btn: (col = "#4f46e5") => ({ background: `linear-gradient(135deg,${col},${col}bb)`, border: "none", borderRadius: 8, padding: "8px 14px", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer", marginRight: 6, marginBottom: 4 } as React.CSSProperties),
+    btn: (col = "#4f46e5", sent = false) => ({
+      background: sent ? "linear-gradient(135deg,#059669,#059669bb)" : `linear-gradient(135deg,${col},${col}bb)`,
+      border: "none", borderRadius: 8, padding: "8px 14px", color: "#fff",
+      fontWeight: 600, fontSize: 12, cursor: sent ? "default" : "pointer",
+      marginRight: 6, marginBottom: 4, transition: "background 0.3s",
+    } as React.CSSProperties),
     badge: (ok: boolean) => ({ display: "inline-block", borderRadius: 5, padding: "2px 7px", fontSize: 10, fontWeight: 700, background: ok ? "#14532d" : "#450a0a", color: ok ? "#4ade80" : "#f87171" } as React.CSSProperties),
     tabBtn: (a: boolean) => ({ padding: "8px 16px", borderRadius: 8, border: "none", background: a ? "#4f46e5" : "transparent", color: a ? "#fff" : "#6b6b8a", fontWeight: 600, fontSize: 12, cursor: "pointer" } as React.CSSProperties),
     input: { background: "#0f0f1a", border: "1px solid #2d2d44", borderRadius: 9, padding: "10px 14px", color: "#e2e2f0", fontSize: 13 } as React.CSSProperties,
@@ -312,7 +361,6 @@ export default function Dashboard() {
         .sort((a, b) => (a as string).localeCompare(b as string)) as string[]
     : [];
 
-  // Owners who have at least one non-compliant channel
   const nonCompliantOwners: string[] = data
     ? Array.from(new Set(data.nonCompliant.map((c: any) => c.ownerName as string)))
         .filter((o) => o && o !== "Unknown")
@@ -329,20 +377,9 @@ export default function Dashboard() {
     .filter((c: any) => ownerFilter === "all" || c.ownerName === ownerFilter)
     .filter((c: any) => c.name.includes(chanSearch.toLowerCase()));
 
-  const kpiGrid4 = {
-    display: "grid" as const,
-    gridTemplateColumns: "repeat(4, 1fr)",
-    gap: 10,
-    marginBottom: 10,
-  };
-  const kpiPrimary = {
-    background: "#1a1a2e", borderRadius: 12, padding: "18px 14px",
-    border: "1px solid #2d2d44", textAlign: "center" as const,
-  };
-  const kpiSecondary = {
-    background: "#13131f", borderRadius: 12, padding: "14px",
-    border: "1px solid #2d2d44", textAlign: "center" as const,
-  };
+  const kpiGrid4 = { display: "grid" as const, gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 10 };
+  const kpiPrimary = { background: "#1a1a2e", borderRadius: 12, padding: "18px 14px", border: "1px solid #2d2d44", textAlign: "center" as const };
+  const kpiSecondary = { background: "#13131f", borderRadius: 12, padding: "14px", border: "1px solid #2d2d44", textAlign: "center" as const };
 
   return (
     <div style={s.wrap}>
@@ -353,9 +390,7 @@ export default function Dashboard() {
           <div style={{ fontSize: 12, color: "#6b6b8a" }}>
             {email}
             {isAdmin && (
-              <span style={{ marginLeft: 8, background: "#1e1b4b", color: "#818cf8", borderRadius: 6, padding: "2px 8px", fontSize: 11 }}>
-                ✦ Admin
-              </span>
+              <span style={{ marginLeft: 8, background: "#1e1b4b", color: "#818cf8", borderRadius: 6, padding: "2px 8px", fontSize: 11 }}>✦ Admin</span>
             )}
           </div>
         </div>
@@ -372,9 +407,7 @@ export default function Dashboard() {
       {/* ── TABS ── */}
       <div style={{ display: "flex", gap: 4, marginBottom: 18, background: "#1a1a2e", borderRadius: 10, padding: 4, width: "fit-content", flexWrap: "wrap" }}>
         {TABS.map((t) => (
-          <button key={t} onClick={() => setTab(t)} style={s.tabBtn(tab === t)}>
-            {TAB_LABELS[t]}
-          </button>
+          <button key={t} onClick={() => setTab(t)} style={s.tabBtn(tab === t)}>{TAB_LABELS[t]}</button>
         ))}
       </div>
 
@@ -389,7 +422,6 @@ export default function Dashboard() {
       {/* ── KPIs ── */}
       {tab === "kpi" && data && (
         <>
-          {/* Row 1 — 4 primary KPIs */}
           <div style={kpiGrid4}>
             <div style={kpiPrimary}>
               <div style={{ fontSize: 20 }}>📢</div>
@@ -417,7 +449,6 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Row 2 — 4 secondary KPIs */}
           <div style={{ ...kpiGrid4, marginBottom: 14 }}>
             {[
               { label: "Inactive +90d", val: data.dormant.length, icon: "💤", color: "#6b6b8a" },
@@ -433,7 +464,6 @@ export default function Dashboard() {
             ))}
           </div>
 
-          {/* Compliance bars */}
           <div style={s.card}>
             <div style={{ fontWeight: 700, marginBottom: 10 }}>Channel compliance</div>
             {[
@@ -443,8 +473,7 @@ export default function Dashboard() {
             ].map((k) => (
               <div key={k.label} style={{ marginBottom: 10 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-                  <span>{k.label}</span>
-                  <span style={{ color: k.color, fontWeight: 700 }}>{k.val}%</span>
+                  <span>{k.label}</span><span style={{ color: k.color, fontWeight: 700 }}>{k.val}%</span>
                 </div>
                 <div style={{ background: "#0f0f1a", borderRadius: 6, height: 8, overflow: "hidden" }}>
                   <div style={{ width: `${k.val}%`, background: k.color, height: "100%", borderRadius: 6 }} />
@@ -472,7 +501,6 @@ export default function Dashboard() {
               );
             })}
           </div>
-
           <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
             <input
               value={chanSearch}
@@ -486,7 +514,6 @@ export default function Dashboard() {
             </select>
             <span style={{ fontSize: 12, color: "#6b6b8a" }}>{filteredChannels.length} results</span>
           </div>
-
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {filteredChannels.map((c: any) => (
               <div key={c.id}>
@@ -530,8 +557,11 @@ export default function Dashboard() {
                       👤 Owner: <span style={{ color: "#818cf8" }}>{c.ownerName}{c.ownerDeactivated ? " (inactive)" : ""}</span>
                     </div>
                     {isAdmin && c.issues.length > 0 && (
-                      <button onClick={() => sendNonCompliantOne(c)} style={s.btn("#dc2626")}>
-                        📩 Notify owner
+                      <button
+                        onClick={() => sendNonCompliantOne(c)}
+                        style={s.btn("#dc2626", !!sentFeedback[`one-${c.id}`])}
+                      >
+                        {sentFeedback[`one-${c.id}`] ? "✅ Sent!" : "📩 Notify owner"}
                       </button>
                     )}
                   </div>
@@ -555,10 +585,13 @@ export default function Dashboard() {
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Non-compliant channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
-                  Sends a single recap to #help-slack listing all {data.nonCompliant.length} non-compliant channels.
+                  Sends a single recap to #help-slack, grouped by owner, listing all {data.nonCompliant.length} non-compliant channels.
                 </div>
-                <button onClick={sendNonCompliantAll} style={s.btn("#dc2626")}>
-                  📩 Send batch non-compliant channels ({data.nonCompliant.length})
+                <button
+                  onClick={sendNonCompliantAll}
+                  style={s.btn("#dc2626", !!sentFeedback["batch-noncompliant"])}
+                >
+                  {sentFeedback["batch-noncompliant"] ? "✅ Sent!" : `📩 Send batch non-compliant channels (${data.nonCompliant.length})`}
                 </button>
               </div>
 
@@ -566,12 +599,12 @@ export default function Dashboard() {
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>👤 Alert by owner</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 12 }}>
-                  Send a targeted alert to #help-slack listing all non-compliant channels for a specific owner.
+                  Send a targeted alert to #help-slack for all non-compliant channels of a specific owner.
                 </div>
                 <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                   <select
                     value={alertOwner}
-                    onChange={(e) => setAlertOwner(e.target.value)}
+                    onChange={(e) => { setAlertOwner(e.target.value); setSentFeedback((p) => ({ ...p, "alert-owner": false })); }}
                     style={{ ...s.select, minWidth: 200 }}
                   >
                     <option value="all">Select an owner...</option>
@@ -583,9 +616,9 @@ export default function Dashboard() {
                   <button
                     onClick={sendAlertForOwner}
                     disabled={alertOwner === "all"}
-                    style={{ ...s.btn("#7c3aed"), opacity: alertOwner === "all" ? 0.5 : 1 }}
+                    style={{ ...s.btn("#7c3aed", !!sentFeedback["alert-owner"]), opacity: alertOwner === "all" ? 0.5 : 1 }}
                   >
-                    📩 Send alert for this owner
+                    {sentFeedback["alert-owner"] ? "✅ Sent!" : "📩 Send alert for this owner"}
                   </button>
                 </div>
               </div>
@@ -594,10 +627,13 @@ export default function Dashboard() {
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>💤 Inactive channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
-                  Sends a single recap to #help-slack for the {data.dormant.length} channels inactive for 90+ days.
+                  Sends a single recap to #help-slack, grouped by owner, for the {data.dormant.length} channels inactive for 90+ days.
                 </div>
-                <button onClick={alertDormant} style={s.btn("#d97706")}>
-                  ⚠️ Send batch inactive channels ({data.dormant.length})
+                <button
+                  onClick={alertDormant}
+                  style={s.btn("#d97706", !!sentFeedback["batch-dormant"])}
+                >
+                  {sentFeedback["batch-dormant"] ? "✅ Sent!" : `⚠️ Send batch inactive channels (${data.dormant.length})`}
                 </button>
               </div>
 
@@ -618,8 +654,11 @@ export default function Dashboard() {
                   )}
                 </div>
                 {data.tempDormant.length > 0 && (
-                  <button onClick={archiveTemp} style={s.btn("#7c3aed")}>
-                    🗑️ Archive ({data.tempDormant.length})
+                  <button
+                    onClick={archiveTemp}
+                    style={s.btn("#7c3aed", !!sentFeedback["archive-temp"])}
+                  >
+                    {sentFeedback["archive-temp"] ? "✅ Archived!" : `🗑️ Archive (${data.tempDormant.length})`}
                   </button>
                 )}
               </div>
