@@ -150,8 +150,8 @@ export default function Dashboard() {
           completed++;
           if (completed % 20 === 0) setLoadMsg(`Activity ${completed}/${channels.length}...`);
         },
-        10,
-        500
+        5,
+        1000
       );
 
       // 5. Merge activity
