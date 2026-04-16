@@ -129,7 +129,8 @@ export default function Dashboard() {
       }));
 
       const helpChan = channels.find((c: any) => c.name === "help-slack");
-      addLog(`🔍 helpChan: ${helpChan ? helpChan.id + ' / ' + helpChan.name : 'NOT FOUND'}`);
+     console.log('HELPCHAN:', helpChan ? helpChan.id + ' / ' + helpChan.name : 'NOT FOUND');
+addLog(`🔍 helpChan: ${helpChan ? helpChan.id + ' / ' + helpChan.name : 'NOT FOUND'}`);
       const pubCount = finalChannels.filter((c: any) => !c.is_private).length;
       const privCount = finalChannels.filter((c: any) => c.is_private).length;
       const nonCompliant = finalChannels.filter((c: any) => c.issues.length > 0);
