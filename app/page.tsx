@@ -128,7 +128,8 @@ export default function Dashboard() {
         dormant: daysSince(chanStats[ch.id] ?? null) > 90,
       }));
 
-      const helpChan = channels.find((c: any) => c.name === "#help-slack");
+      const helpChan = channels.find((c: any) => c.name === "help-slack");
+      addLog(`🔍 helpChan: ${helpChan ? helpChan.id + ' / ' + helpChan.name : 'NOT FOUND'}`);
       const pubCount = finalChannels.filter((c: any) => !c.is_private).length;
       const privCount = finalChannels.filter((c: any) => c.is_private).length;
       const nonCompliant = finalChannels.filter((c: any) => c.issues.length > 0);
