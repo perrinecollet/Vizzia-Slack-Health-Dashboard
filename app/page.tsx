@@ -36,12 +36,22 @@ async function batchedMap<T, R>(
   return results;
 }
 
-const TABS = ["kpi", "channels", "actions", "log"] as const;
+// ── Changement 1 : ajout de "people" dans TABS et TAB_LABELS ─────────────────
+const TABS = ["kpi", "channels", "people", "actions", "log"] as const;
 const TAB_LABELS: Record<string, string> = {
   kpi: "📊 KPIs",
   channels: "📢 Channels",
+  people: "👥 People",
   actions: "🚀 Actions",
   log: "📋 Log",
+};
+
+// ── Helpers People ────────────────────────────────────────────────────────────
+const isValidDisplayName = (name: string) => {
+  if (!name || name.trim() === "") return false;
+  const parts = name.trim().split(/\s+/);
+  if (parts.length < 2) return false;
+  return parts.every((p: string) => p[0] === p[0].toUpperCase() && p[0] !== p[0].toLowerCase());
 };
 
 export default function Dashboard() {
@@ -59,7 +69,8 @@ export default function Dashboard() {
   const [ownerFilter, setOwnerFilter] = useState("all");
   const [expandedChan, setExpandedChan] = useState<string | null>(null);
   const [alertOwner, setAlertOwner] = useState("all");
-  // Button feedback state: key = button id, value = "sent" | null
+  // Changement 2 : state sous-onglet People
+  const [peopleSubTab, setPeopleSubTab] = useState<"externes" | "noncompliant">("externes");
   const [sentFeedback, setSentFeedback] = useState<Record<string, boolean>>({});
 
   const addLog = (msg: string) =>
@@ -90,7 +101,7 @@ export default function Dashboard() {
         cursor = r.response_metadata?.next_cursor || "";
       } while (cursor);
 
-      // 2. Members (include deactivated for owner name resolution)
+      // 2. Members
       setLoadMsg(`${channels.length} channels. Fetching members...`);
       let members: any[] = [], mc = "";
       do {
@@ -106,6 +117,9 @@ export default function Dashboard() {
       } while (mc);
 
       const memberMap: Record<string, string> = {};
+
+      // Changement 3 : calcul externes + non compliant people
+      const externalMembers: any[] = [];
       let externalCount = 0;
       const activeCount = members.filter((m: any) => !m.deleted).length;
 
@@ -115,11 +129,30 @@ export default function Dashboard() {
           const memberEmail: string = m.profile?.email || "";
           if (memberEmail && !memberEmail.endsWith("@vizzia.fr")) {
             externalCount++;
+            externalMembers.push(m);
           }
         }
       }
 
-      // 3. Compliance check
+      const nonCompliantPeople = members
+        .filter((m: any) => {
+          if (m.deleted) return false;
+          if (m.is_restricted || m.is_ultra_restricted) return false;
+          const memberEmail: string = m.profile?.email || "";
+          if (memberEmail && !memberEmail.endsWith("@vizzia.fr")) return false;
+          return true;
+        })
+        .map((m: any) => {
+          const displayName = m.profile?.display_name || m.real_name || "";
+          const title = m.profile?.title || "";
+          const reasons: string[] = [];
+          if (!isValidDisplayName(displayName)) reasons.push("Display Name invalide");
+          if (!title.trim()) reasons.push("Title manquant");
+          return { ...m, displayName, title, reasons };
+        })
+        .filter((m: any) => m.reasons.length > 0);
+
+      // 3. Compliance check channels
       const withIssues = channels.map((ch: any) => {
         const issues: string[] = [];
         if (!NAMING_PREFIXES.some((p) => ch.name.startsWith(p))) issues.push("naming");
@@ -129,11 +162,10 @@ export default function Dashboard() {
         const ownerDeactivated = ch.creator
           ? (members.find((m: any) => m.id === ch.creator)?.deleted ?? false)
           : false;
-        // Keep creator ID for Slack tagging
         return { ...ch, issues, ownerName, ownerDeactivated, lastTs: null, dormant: false };
       });
 
-      // 4. Activity — batches of 10 in parallel
+      // 4. Activity
       setLoadMsg(`Fetching activity (${channels.length} channels)...`);
       let completed = 0;
       const chanStats: Record<string, string | null> = {};
@@ -167,6 +199,7 @@ export default function Dashboard() {
       const dormant = finalChannels.filter((c: any) => c.dormant && !c.name.startsWith("temp-"));
       const tempDormant = finalChannels.filter((c: any) => c.name.startsWith("temp-") && c.dormant);
 
+      // Changement 4 : ajout de externalMembers et nonCompliantPeople dans setData
       setData({
         channels: finalChannels,
         members: members.filter((m: any) => !m.deleted),
@@ -177,6 +210,8 @@ export default function Dashboard() {
         pubCount,
         externalCount,
         activeCount,
+        externalMembers,
+        nonCompliantPeople,
         withDesc: finalChannels.filter((c: any) => c.purpose?.value).length,
         withTopic: finalChannels.filter((c: any) => c.topic?.value).length,
         namingCompliant: finalChannels.filter((c: any) => !c.issues.includes("naming")).length,
@@ -212,13 +247,11 @@ export default function Dashboard() {
     else addLog(`❌ Failed for #${ch.name}: ${r.error}`);
   };
 
-  // Batch non-compliant — grouped by owner, one line per channel
   const sendNonCompliantAll = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     if (data.nonCompliant.length === 0) { addLog("✅ No non-compliant channels"); return; }
     const date = new Date().toLocaleDateString("en-GB");
 
-    // Group by creator ID
     const byOwner: Record<string, any[]> = {};
     for (const c of data.nonCompliant) {
       const key = c.creator || c.ownerName;
@@ -251,7 +284,6 @@ export default function Dashboard() {
     else addLog(`❌ Send failed: ${r.error}`);
   };
 
-  // Alert by specific owner — grouped, one line per channel
   const sendAlertForOwner = async () => {
     if (!data?.helpChan) { addLog("❌ #help-slack not found"); return; }
     if (alertOwner === "all") { addLog("❌ Please select a specific owner"); return; }
@@ -286,7 +318,6 @@ export default function Dashboard() {
     if (data.dormant.length === 0) { addLog("✅ No inactive channels"); return; }
     const date = new Date().toLocaleDateString("en-GB");
 
-    // Group by owner
     const byOwner: Record<string, any[]> = {};
     for (const c of data.dormant) {
       const key = c.creator || c.ownerName;
@@ -335,6 +366,7 @@ export default function Dashboard() {
     } as React.CSSProperties),
     badge: (ok: boolean) => ({ display: "inline-block", borderRadius: 5, padding: "2px 7px", fontSize: 10, fontWeight: 700, background: ok ? "#14532d" : "#450a0a", color: ok ? "#4ade80" : "#f87171" } as React.CSSProperties),
     tabBtn: (a: boolean) => ({ padding: "8px 16px", borderRadius: 8, border: "none", background: a ? "#4f46e5" : "transparent", color: a ? "#fff" : "#6b6b8a", fontWeight: 600, fontSize: 12, cursor: "pointer" } as React.CSSProperties),
+    subTabBtn: (a: boolean) => ({ padding: "6px 14px", borderRadius: 8, border: "none", background: a ? "#312e81" : "transparent", color: a ? "#a5b4fc" : "#6b6b8a", fontWeight: 600, fontSize: 12, cursor: "pointer" } as React.CSSProperties),
     input: { background: "#0f0f1a", border: "1px solid #2d2d44", borderRadius: 9, padding: "10px 14px", color: "#e2e2f0", fontSize: 13 } as React.CSSProperties,
     select: { background: "#1a1a2e", border: "1px solid #2d2d44", borderRadius: 8, padding: "7px 12px", color: "#e2e2f0", fontSize: 12, cursor: "pointer" } as React.CSSProperties,
     row: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #2d2d44", gap: 8, flexWrap: "wrap" } as React.CSSProperties,
@@ -572,6 +604,86 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* ── Changement 5 : PEOPLE ── */}
+      {tab === "people" && data && (
+        <div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 14, background: "#1a1a2e", borderRadius: 10, padding: 4, width: "fit-content" }}>
+            {(["externes", "noncompliant"] as const).map((st) => (
+              <button key={st} onClick={() => setPeopleSubTab(st)} style={s.subTabBtn(peopleSubTab === st)}>
+                {st === "externes"
+                  ? `🌍 Externes (${data.externalMembers.length})`
+                  : `⚠️ Non compliant (${data.nonCompliantPeople.length})`}
+              </button>
+            ))}
+          </div>
+
+          {/* Externes */}
+          {peopleSubTab === "externes" && (
+            <div style={s.card}>
+              <div style={{ fontWeight: 700, marginBottom: 10 }}>🌍 Membres externes</div>
+              {data.externalMembers.length === 0 ? (
+                <div style={{ color: "#4ade80", fontSize: 13 }}>✅ Aucun membre externe</div>
+              ) : (
+                <div style={{ maxHeight: 500, overflowY: "auto" }}>
+                  {data.externalMembers.map((m: any) => (
+                    <div key={m.id} style={s.row}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        {m.profile?.image_48 && (
+                          <img src={m.profile.image_48} alt="" style={{ width: 32, height: 32, borderRadius: "50%" }} />
+                        )}
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: 13 }}>{m.real_name || m.name}</div>
+                          <div style={{ fontSize: 11, color: "#6b6b8a" }}>{m.profile?.email || "—"}</div>
+                        </div>
+                      </div>
+                      <span style={{ fontSize: 11, background: "#1c1917", color: "#f97316", borderRadius: 5, padding: "2px 8px" }}>
+                        🌍 Externe
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Non compliant */}
+          {peopleSubTab === "noncompliant" && (
+            <div style={s.card}>
+              <div style={{ fontWeight: 700, marginBottom: 10 }}>⚠️ Membres non compliant</div>
+              <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 12 }}>
+                Règles : Display Name au format &quot;Prénom Nom&quot; (min. 2 mots, majuscules) · Title renseigné
+              </div>
+              {data.nonCompliantPeople.length === 0 ? (
+                <div style={{ color: "#4ade80", fontSize: 13 }}>✅ Tous les membres sont compliant</div>
+              ) : (
+                <div style={{ maxHeight: 500, overflowY: "auto" }}>
+                  {data.nonCompliantPeople.map((m: any) => (
+                    <div key={m.id} style={s.row}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        {m.profile?.image_48 && (
+                          <img src={m.profile.image_48} alt="" style={{ width: 32, height: 32, borderRadius: "50%" }} />
+                        )}
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: 13 }}>{m.real_name || m.name}</div>
+                          <div style={{ fontSize: 11, color: "#6b6b8a" }}>
+                            Display: &quot;{m.displayName || "—"}&quot; · Title: &quot;{m.title || "—"}&quot;
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                        {m.reasons.map((r: string) => (
+                          <span key={r} style={s.badge(false)}>{r}</span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── ACTIONS ── */}
       {tab === "actions" && (
         <div>
@@ -581,21 +693,16 @@ export default function Dashboard() {
             </div>
           ) : data ? (
             <>
-              {/* Batch non-compliant */}
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>📋 Non-compliant channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
                   Sends a single recap to #help-slack, grouped by owner, listing all {data.nonCompliant.length} non-compliant channels.
                 </div>
-                <button
-                  onClick={sendNonCompliantAll}
-                  style={s.btn("#dc2626", !!sentFeedback["batch-noncompliant"])}
-                >
+                <button onClick={sendNonCompliantAll} style={s.btn("#dc2626", !!sentFeedback["batch-noncompliant"])}>
                   {sentFeedback["batch-noncompliant"] ? "✅ Sent!" : `📩 Send batch non-compliant channels (${data.nonCompliant.length})`}
                 </button>
               </div>
 
-              {/* Alert by owner */}
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>👤 Alert by owner</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 12 }}>
@@ -623,21 +730,16 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Batch inactive */}
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>💤 Inactive channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 10 }}>
                   Sends a single recap to #help-slack, grouped by owner, for the {data.dormant.length} channels inactive for 90+ days.
                 </div>
-                <button
-                  onClick={alertDormant}
-                  style={s.btn("#d97706", !!sentFeedback["batch-dormant"])}
-                >
+                <button onClick={alertDormant} style={s.btn("#d97706", !!sentFeedback["batch-dormant"])}>
                   {sentFeedback["batch-dormant"] ? "✅ Sent!" : `⚠️ Send batch inactive channels (${data.dormant.length})`}
                 </button>
               </div>
 
-              {/* Archive temp */}
               <div style={s.card}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>🗑️ Archive inactive temp- channels</div>
                 <div style={{ fontSize: 12, color: "#6b6b8a", marginBottom: 8 }}>
@@ -654,10 +756,7 @@ export default function Dashboard() {
                   )}
                 </div>
                 {data.tempDormant.length > 0 && (
-                  <button
-                    onClick={archiveTemp}
-                    style={s.btn("#7c3aed", !!sentFeedback["archive-temp"])}
-                  >
+                  <button onClick={archiveTemp} style={s.btn("#7c3aed", !!sentFeedback["archive-temp"])}>
                     {sentFeedback["archive-temp"] ? "✅ Archived!" : `🗑️ Archive (${data.tempDormant.length})`}
                   </button>
                 )}
